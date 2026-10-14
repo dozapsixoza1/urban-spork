@@ -20,6 +20,11 @@ jobs:
       - name: Extract source
         shell: pwsh
         run: |
+          if (-not (Test-Path "src.zip")) {
+            Write-Host "ERROR: src.zip not found"
+            exit 1
+          }
+
           Expand-Archive -Path src.zip -DestinationPath work -Force
 
       - name: Fix RakNet include
@@ -27,6 +32,11 @@ jobs:
         run: |
           $incdir = Get-ChildItem work -Recurse -Directory -Filter include |
             Select-Object -First 1
+
+          if (-not $incdir) {
+            Write-Host "ERROR: include directory not found"
+            exit 1
+          }
 
           $target = Join-Path $incdir.FullName "Pawn_RakNet.inc"
 
@@ -40,17 +50,15 @@ jobs:
             }
           }
 
-      - name: Diagnose Pawn CMD aliases
+      - name: Diagnose source
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Continue"
-
           New-Item out -ItemType Directory -Force | Out-Null
 
-          $pwn = Get-ChildItem work -Recurse -Filter main.pwn |
+          $pwn = Get-ChildItem work -Recurse -File -Filter main.pwn |
             Select-Object -First 1
 
-          $compiler = Get-ChildItem work -Recurse -Filter pawncc.exe |
+          $compiler = Get-ChildItem work -Recurse -File -Filter pawncc.exe |
             Select-Object -First 1
 
           if (-not $pwn -or -not $compiler) {
@@ -59,103 +67,56 @@ jobs:
           }
 
           Write-Host "MAIN: $($pwn.FullName)"
+          Write-Host "MAIN SIZE: $($pwn.Length) bytes"
           Write-Host "COMPILER: $($compiler.FullName)"
 
-          Write-Host "`n========== MAIN INCLUDES =========="
+          Write-Host "`n========== FIRST 150 LINES =========="
+          Get-Content $pwn.FullName -TotalCount 150
 
+          Write-Host "`n========== MAIN FUNCTIONS =========="
           Select-String -Path $pwn.FullName `
-            -Pattern '^\s*#\s*include' |
+            -Pattern 'public OnGameModeInit|public OnGameModeExit|public OnPlayerConnect|main\(' |
+            Select-Object -First 40 |
             ForEach-Object {
               Write-Host "$($_.LineNumber): $($_.Line.Trim())"
             }
 
-          Write-Host "`n========== ALIAS DEFINITIONS AND UNDEFINES =========="
-
-          Get-ChildItem work -Recurse -File |
-            Where-Object { $_.Extension -in @(".pwn", ".inc") } |
-            Select-String -Pattern '^\s*#\s*(define|undef|if|elseif|ifdef|ifndef).*alias|^\s*#\s*define\s+(cmd|CMD|COMMAND)' |
+          Write-Host "`n========== REGISTRATION DEBUG =========="
+          Select-String -Path $pwn.FullName `
+            -Pattern 'REG DEBUG|Password callback reached|OnPasswordHashed' |
+            Select-Object -First 30 |
             ForEach-Object {
-              Write-Host "$($_.Path):$($_.LineNumber): $($_.Line.Trim())"
+              Write-Host "$($_.LineNumber): $($_.Line.Trim())"
             }
 
-          Write-Host "`n========== PAWN CMD FILES =========="
-
-          $cmdFiles = Get-ChildItem work -Recurse -File |
-            Where-Object {
-              $_.Name -match '^(pawn.?cmd|zcmd)\.inc$'
-            }
-
-          foreach ($file in $cmdFiles) {
-            Write-Host "`nFILE: $($file.FullName)"
-
-            $lines = Get-Content $file.FullName
-            $start = 60
-            $end = [Math]::Min(95, $lines.Count)
-
-            for ($i = $start; $i -le $end; $i++) {
-              Write-Host ("{0}: {1}" -f $i, $lines[$i - 1])
-            }
-          }
-
-          Write-Host "`n========== CREATE ALIAS PROBE =========="
-
-          $probe = @'
-          #include <a_samp>
-          #include <pawncmd>
-
-          CMD:aliasprobe(playerid, params[])
-          {
-              return 1;
-          }
-          alias:aliasprobe("aprobe");
-          '@
-
-          $probePath = Join-Path $pwn.DirectoryName "alias_probe.pwn"
-          Set-Content -Path $probePath -Value $probe
-
-          $probeLog = Join-Path $env:GITHUB_WORKSPACE "out\alias_probe.log"
-
-          $includeArgs = @()
-          Get-ChildItem work -Recurse -Directory -Filter include |
+          Write-Host "`n========== CONDITIONAL DIRECTIVES =========="
+          Select-String -Path $pwn.FullName `
+            -Pattern '^\s*#\s*(if|elseif|else|endif)\b' |
+            Select-Object -First 150 |
             ForEach-Object {
-              $includeArgs += ("-i" + $_.FullName)
+              Write-Host "$($_.LineNumber): $($_.Line.Trim())"
             }
-
-          Push-Location $pwn.DirectoryName
-
-          try {
-            & $compiler.FullName @includeArgs "alias_probe.pwn" "-d3" *> $probeLog
-            $probeExit = $LASTEXITCODE
-          }
-          catch {
-            $_ | Out-String | Out-File $probeLog -Append
-            $probeExit = 1
-          }
-          finally {
-            Pop-Location
-          }
-
-          Write-Host "ALIAS PROBE EXIT CODE: $probeExit"
-          Get-Content $probeLog
-
-          "Alias probe exit code: $probeExit" |
-            Out-File out\alias_probe_status.txt
 
       - name: Compile main
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Continue"
+
           New-Item out -ItemType Directory -Force | Out-Null
 
-          $pwn = Get-ChildItem work -Recurse -Filter main.pwn |
+          $pwn = Get-ChildItem work -Recurse -File -Filter main.pwn |
             Select-Object -First 1
 
-          $compiler = Get-ChildItem work -Recurse -Filter pawncc.exe |
+          $compiler = Get-ChildItem work -Recurse -File -Filter pawncc.exe |
             Select-Object -First 1
 
           if (-not $pwn -or -not $compiler) {
             Write-Host "ERROR: main.pwn or pawncc.exe not found"
             exit 1
           }
+
+          Write-Host "Compiling: $($pwn.FullName)"
+          Write-Host "Compiler: $($compiler.FullName)"
 
           $opts = @("main.pwn", "-d3")
 
@@ -164,15 +125,16 @@ jobs:
               $opts += ("-i" + $_.FullName)
             }
 
+          $compileLog = "$env:GITHUB_WORKSPACE\out\compile.log"
+
           Push-Location $pwn.DirectoryName
 
           try {
-            & $compiler.FullName @opts *> "$env:GITHUB_WORKSPACE\out\compile.log"
+            & $compiler.FullName @opts *> $compileLog
             $compileExit = $LASTEXITCODE
           }
           catch {
-            $_ | Out-String |
-              Out-File "$env:GITHUB_WORKSPACE\out\compile.log" -Append
+            $_ | Out-String | Out-File $compileLog -Append
             $compileExit = 1
           }
           finally {
@@ -181,27 +143,56 @@ jobs:
 
           Write-Host "COMPILER EXIT CODE: $compileExit"
 
-          if (Test-Path "$($pwn.DirectoryName)\main.amx") {
-            Copy-Item "$($pwn.DirectoryName)\main.amx" out\main.amx -Force
-            Write-Host "main.amx created"
+          $amxPath = Join-Path $pwn.DirectoryName "main.amx"
+
+          if (Test-Path $amxPath) {
+            $amx = Get-Item $amxPath
+            Write-Host "Generated AMX size: $($amx.Length) bytes"
           }
           else {
-            Write-Host "main.amx not generated"
+            Write-Host "ERROR: main.amx was not generated"
           }
 
-          Get-Content out\compile.log -Tail 100
+          Write-Host "`n========== COMPILER LOG =========="
+
+          if (Test-Path $compileLog) {
+            Get-Content $compileLog -Tail 150
+          }
 
           "Compiler exit code: $compileExit" |
             Out-File out\compiler_status.txt
 
-          if ($compileExit -ne 0) {
-            exit $compileExit
+          $hasErrors = $false
+
+          if (Test-Path $compileLog) {
+            $hasErrors = [bool](Select-String `
+              -Path $compileLog `
+              -Pattern 'error\s+\d+|fatal error|Compilation aborted' `
+              -Quiet)
           }
 
-          if (-not (Test-Path out\main.amx)) {
+          if ($compileExit -ne 0 -or $hasErrors) {
+            Write-Host "ERROR: compilation failed"
+            exit 1
+          }
+
+          if (-not (Test-Path $amxPath)) {
             Write-Host "ERROR: main.amx missing"
             exit 1
           }
+
+          $amx = Get-Item $amxPath
+
+          if ($amx.Length -lt 1000000) {
+            Write-Host "ERROR: AMX is suspiciously small: $($amx.Length) bytes"
+            Write-Host "The file will not be published as a successful build."
+            exit 1
+          }
+
+          Copy-Item $amxPath out\main.amx -Force
+
+          Write-Host "Build validation passed."
+          Write-Host "Final AMX size: $((Get-Item out\main.amx).Length) bytes"
 
       - name: Upload logs and AMX
         if: always()
