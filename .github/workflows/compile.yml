@@ -14,34 +14,29 @@ jobs:
       - name: Install runtimes
         shell: pwsh
         continue-on-error: true
-        run: choco install vcredist2005 vcredist2008 vcredist2010 vcredist140 -y --no-progress
-
-      - name: Unzip
-        shell: pwsh
-        run: Expand-Archive -Path src.zip -DestinationPath work -Force
-
-      - name: RakNet include fix
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
-          $has = Get-ChildItem work -Recurse -Filter Pawn_RakNet.inc
+          choco install vcredist2005 vcredist2008 vcredist2010 vcredist140 -y --no-progress
+
+      - name: Extract source
+        shell: pwsh
+        run: |
+          Expand-Archive -Path src.zip -DestinationPath work -Force
+
+      - name: Fix RakNet include
+        shell: pwsh
+        run: |
           $incdir = Get-ChildItem work -Recurse -Directory -Filter include |
             Select-Object -First 1
 
-          if ($has) {
-            Write-Host "Pawn_RakNet.inc already present"
-          }
-          else {
-            $dot = Get-ChildItem work -Recurse -Filter Pawn.RakNet.inc |
+          $target = Join-Path $incdir.FullName "Pawn_RakNet.inc"
+
+          if (-not (Test-Path $target)) {
+            $source = Get-ChildItem work -Recurse -Filter Pawn.RakNet.inc |
               Select-Object -First 1
 
-            if ($dot -and $incdir) {
-              Copy-Item $dot.FullName (Join-Path $incdir.FullName "Pawn_RakNet.inc")
-              Write-Host "Copied Pawn.RakNet.inc as Pawn_RakNet.inc"
-            }
-            else {
-              Write-Host "WARNING: RakNet include not found"
+            if ($source) {
+              Copy-Item $source.FullName $target
+              Write-Host "RakNet include copied"
             }
           }
 
@@ -50,21 +45,23 @@ jobs:
         run: |
           $ErrorActionPreference = "Continue"
 
-          Write-Host "========== FIND MAIN.PWN =========="
+          New-Item out -ItemType Directory -Force | Out-Null
 
           $pwn = Get-ChildItem work -Recurse -Filter main.pwn |
-            Sort-Object Length -Descending |
             Select-Object -First 1
 
-          if (-not $pwn) {
-            Write-Host "ERROR: main.pwn not found"
+          $compiler = Get-ChildItem work -Recurse -Filter pawncc.exe |
+            Select-Object -First 1
+
+          if (-not $pwn -or -not $compiler) {
+            Write-Host "ERROR: main.pwn or pawncc.exe not found"
             exit 1
           }
 
           Write-Host "MAIN: $($pwn.FullName)"
-          Write-Host "MAIN DIRECTORY: $($pwn.DirectoryName)"
+          Write-Host "COMPILER: $($compiler.FullName)"
 
-          Write-Host "`n========== MAIN.PWN INCLUDES =========="
+          Write-Host "`n========== MAIN INCLUDES =========="
 
           Select-String -Path $pwn.FullName `
             -Pattern '^\s*#\s*include' |
@@ -72,84 +69,93 @@ jobs:
               Write-Host "$($_.LineNumber): $($_.Line.Trim())"
             }
 
-          $files = Get-ChildItem work -Recurse -File |
+          Write-Host "`n========== ALIAS DEFINITIONS AND UNDEFINES =========="
+
+          Get-ChildItem work -Recurse -File |
+            Where-Object { $_.Extension -in @(".pwn", ".inc") } |
+            Select-String -Pattern '^\s*#\s*(define|undef|if|elseif|ifdef|ifndef).*alias|^\s*#\s*define\s+(cmd|CMD|COMMAND)' |
+            ForEach-Object {
+              Write-Host "$($_.Path):$($_.LineNumber): $($_.Line.Trim())"
+            }
+
+          Write-Host "`n========== PAWN CMD FILES =========="
+
+          $cmdFiles = Get-ChildItem work -Recurse -File |
             Where-Object {
-              $_.Name -match '^(pawn.?cmd|zcmd|y.?commands)\.inc$'
+              $_.Name -match '^(pawn.?cmd|zcmd)\.inc$'
             }
 
-          Write-Host "`n========== FOUND COMMAND INCLUDES =========="
-
-          if (-not $files) {
-            Write-Host "No command include files found"
-          }
-
-          foreach ($file in $files) {
-            Write-Host "`n"
-            Write-Host "=========================================="
-            Write-Host "FILE: $($file.FullName)"
-            Write-Host "=========================================="
-
-            $lines = Get-Content $file.FullName
-            $limit = [Math]::Min($lines.Count, 130)
-
-            for ($i = 0; $i -lt $limit; $i++) {
-              Write-Host ("{0,4}: {1}" -f ($i + 1), $lines[$i])
-            }
-          }
-
-          Write-Host "`n========== ALL ALIAS DEFINITIONS =========="
-
-          $sources = Get-ChildItem work -Recurse -File |
-            Where-Object {
-              $_.Extension -in @(".inc", ".pwn")
-            }
-
-          $matches = $sources |
-            Select-String -Pattern '^\s*#\s*(define|if|elseif|endif).*alias|^\s*#\s*define\s+alias'
-
-          if ($matches) {
-            foreach ($match in $matches) {
-              Write-Host "$($match.Path):$($match.LineNumber): $($match.Line.Trim())"
-            }
-          }
-          else {
-            Write-Host "No alias macro definitions found"
-          }
-
-          Write-Host "`n========== INCLUDE GUARDS =========="
-
-          foreach ($file in $files) {
+          foreach ($file in $cmdFiles) {
             Write-Host "`nFILE: $($file.FullName)"
 
-            Select-String -Path $file.FullName `
-              -Pattern '^\s*#\s*(if|ifdef|ifndef|define|endif)' |
-              Select-Object -First 20 |
-              ForEach-Object {
-                Write-Host "$($_.LineNumber): $($_.Line.Trim())"
-              }
+            $lines = Get-Content $file.FullName
+            $start = 60
+            $end = [Math]::Min(95, $lines.Count)
+
+            for ($i = $start; $i -le $end; $i++) {
+              Write-Host ("{0}: {1}" -f $i, $lines[$i - 1])
+            }
           }
 
-          Write-Host "`n========== DIAGNOSTICS COMPLETE =========="
+          Write-Host "`n========== CREATE ALIAS PROBE =========="
 
-      - name: Compile
+          $probe = @'
+          #include <a_samp>
+          #include <pawncmd>
+
+          CMD:aliasprobe(playerid, params[])
+          {
+              return 1;
+          }
+          alias:aliasprobe("aprobe");
+          '@
+
+          $probePath = Join-Path $pwn.DirectoryName "alias_probe.pwn"
+          Set-Content -Path $probePath -Value $probe
+
+          $probeLog = Join-Path $env:GITHUB_WORKSPACE "out\alias_probe.log"
+
+          $includeArgs = @()
+          Get-ChildItem work -Recurse -Directory -Filter include |
+            ForEach-Object {
+              $includeArgs += ("-i" + $_.FullName)
+            }
+
+          Push-Location $pwn.DirectoryName
+
+          try {
+            & $compiler.FullName @includeArgs "alias_probe.pwn" "-d3" *> $probeLog
+            $probeExit = $LASTEXITCODE
+          }
+          catch {
+            $_ | Out-String | Out-File $probeLog -Append
+            $probeExit = 1
+          }
+          finally {
+            Pop-Location
+          }
+
+          Write-Host "ALIAS PROBE EXIT CODE: $probeExit"
+          Get-Content $probeLog
+
+          "Alias probe exit code: $probeExit" |
+            Out-File out\alias_probe_status.txt
+
+      - name: Compile main
         shell: pwsh
         run: |
           New-Item out -ItemType Directory -Force | Out-Null
 
           $pwn = Get-ChildItem work -Recurse -Filter main.pwn |
-            Sort-Object Length -Descending |
             Select-Object -First 1
 
-          $cc = Get-ChildItem work -Recurse -Filter pawncc.exe |
+          $compiler = Get-ChildItem work -Recurse -Filter pawncc.exe |
             Select-Object -First 1
 
-          if (-not $pwn -or -not $cc) {
+          if (-not $pwn -or -not $compiler) {
             Write-Host "ERROR: main.pwn or pawncc.exe not found"
             exit 1
           }
-
-          Write-Host "Compiler: $($cc.FullName)"
-          Write-Host "Source: $($pwn.FullName)"
 
           $opts = @("main.pwn", "-d3")
 
@@ -158,13 +164,10 @@ jobs:
               $opts += ("-i" + $_.FullName)
             }
 
-          Write-Host "`n========== COMPILER ARGUMENTS =========="
-          $opts | ForEach-Object { Write-Host $_ }
-
           Push-Location $pwn.DirectoryName
 
           try {
-            & $cc.FullName @opts *> "$env:GITHUB_WORKSPACE\out\compile.log"
+            & $compiler.FullName @opts *> "$env:GITHUB_WORKSPACE\out\compile.log"
             $compileExit = $LASTEXITCODE
           }
           catch {
@@ -176,21 +179,17 @@ jobs:
             Pop-Location
           }
 
-          Write-Host "`nCompiler exit code: $compileExit"
+          Write-Host "COMPILER EXIT CODE: $compileExit"
 
           if (Test-Path "$($pwn.DirectoryName)\main.amx") {
             Copy-Item "$($pwn.DirectoryName)\main.amx" out\main.amx -Force
-            Write-Host "main.amx found and copied"
+            Write-Host "main.amx created"
           }
           else {
-            Write-Host "main.amx was not generated"
+            Write-Host "main.amx not generated"
           }
 
-          Write-Host "`n========== COMPILER OUTPUT =========="
-
-          if (Test-Path out\compile.log) {
-            Get-Content out\compile.log -Tail 100
-          }
+          Get-Content out\compile.log -Tail 100
 
           "Compiler exit code: $compileExit" |
             Out-File out\compiler_status.txt
@@ -200,79 +199,11 @@ jobs:
           }
 
           if (-not (Test-Path out\main.amx)) {
-            Write-Host "ERROR: Compilation returned success but main.amx is missing"
+            Write-Host "ERROR: main.amx missing"
             exit 1
           }
 
-          Write-Host "Compilation succeeded"
-
-      - name: Show error lines
-        if: always()
-        shell: pwsh
-        run: |
-          New-Item out -ItemType Directory -Force | Out-Null
-          $report = @()
-
-          if (Test-Path out\compile.log) {
-            $errs = Get-Content out\compile.log |
-              Where-Object {
-                $_ -match '^(.+?)\((\d+)\)\s*:\s*(error|fatal)'
-              } |
-              Select-Object -First 30
-
-            foreach ($e in $errs) {
-              $report += $e
-
-              if ($e -match '^(.+?)\((\d+)\)\s*:') {
-                $f = $Matches[1]
-                $n = [int]$Matches[2]
-                $leaf = Split-Path $f -Leaf
-
-                $p = Get-ChildItem work -Recurse -File -Filter $leaf |
-                  Where-Object {
-                    $_.FullName.Replace('\','/') -like "*$($f.Replace('\','/'))"
-                  } |
-                  Select-Object -First 1
-
-                if (-not $p) {
-                  $p = Get-ChildItem work -Recurse -File -Filter $leaf |
-                    Select-Object -First 1
-                }
-
-                $report += "=== Source context: $f line $n"
-
-                if ($p) {
-                  $lines = Get-Content $p.FullName
-
-                  for (
-                    $i = [Math]::Max(1, $n - 3);
-                    $i -le [Math]::Min($lines.Count, $n + 2);
-                    $i++
-                  ) {
-                    $report += ("{0}: {1}" -f $i, $lines[$i - 1])
-                  }
-                }
-                else {
-                  $report += "Source file not found in archive"
-                }
-              }
-            }
-
-            if (-not $errs) {
-              $report += "No standard Pawn compiler error lines matched."
-              $report += "Check compile.log for the full output."
-            }
-          }
-          else {
-            $report += "compile.log was not created."
-          }
-
-          $report | Out-File out\error_lines.txt
-
-          Write-Host "========== ERROR REPORT =========="
-          $report | ForEach-Object { Write-Host $_ }
-
-      - name: Upload diagnostics and build
+      - name: Upload logs and AMX
         if: always()
         uses: actions/upload-artifact@v4
         with:
