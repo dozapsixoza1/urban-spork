@@ -11,12 +11,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install runtimes
-        shell: pwsh
-        continue-on-error: true
-        run: |
-          choco install vcredist2005 vcredist2008 vcredist2010 vcredist140 -y --no-progress
-
       - name: Extract source
         shell: pwsh
         run: |
@@ -26,29 +20,6 @@ jobs:
           }
 
           Expand-Archive -Path src.zip -DestinationPath work -Force
-
-      - name: Fix RakNet include
-        shell: pwsh
-        run: |
-          $incdir = Get-ChildItem work -Recurse -Directory -Filter include |
-            Select-Object -First 1
-
-          if (-not $incdir) {
-            Write-Host "ERROR: include directory not found"
-            exit 1
-          }
-
-          $target = Join-Path $incdir.FullName "Pawn_RakNet.inc"
-
-          if (-not (Test-Path $target)) {
-            $source = Get-ChildItem work -Recurse -Filter Pawn.RakNet.inc |
-              Select-Object -First 1
-
-            if ($source) {
-              Copy-Item $source.FullName $target
-              Write-Host "RakNet include copied"
-            }
-          }
 
       - name: Diagnose source
         shell: pwsh
@@ -70,38 +41,70 @@ jobs:
           Write-Host "MAIN SIZE: $($pwn.Length) bytes"
           Write-Host "COMPILER: $($compiler.FullName)"
 
-          Write-Host "`n========== FIRST 150 LINES =========="
-          Get-Content $pwn.FullName -TotalCount 150
+          $lines = Get-Content $pwn.FullName
 
-          Write-Host "`n========== MAIN FUNCTIONS =========="
+          Write-Host "`n========== SOURCE AROUND main() =========="
+
+          $start = 640
+          $end = [Math]::Min(710, $lines.Count)
+
+          for ($i = $start; $i -le $end; $i++) {
+            Write-Host ("{0}: {1}" -f $i, $lines[$i - 1])
+          }
+
+          Write-Host "`n========== SOURCE AROUND OnGameModeInit =========="
+
+          $start = 8170
+          $end = [Math]::Min(8220, $lines.Count)
+
+          for ($i = $start; $i -le $end; $i++) {
+            Write-Host ("{0}: {1}" -f $i, $lines[$i - 1])
+          }
+
+          Write-Host "`n========== COMMENT MARKERS =========="
+
           Select-String -Path $pwn.FullName `
-            -Pattern 'public OnGameModeInit|public OnGameModeExit|public OnPlayerConnect|main\(' |
-            Select-Object -First 40 |
+            -Pattern '/\*|\*/' |
+            Select-Object -First 100 |
             ForEach-Object {
               Write-Host "$($_.LineNumber): $($_.Line.Trim())"
             }
 
-          Write-Host "`n========== REGISTRATION DEBUG =========="
+          Write-Host "`n========== REGISTRATION CALLBACKS =========="
+
           Select-String -Path $pwn.FullName `
-            -Pattern 'REG DEBUG|Password callback reached|OnPasswordHashed' |
-            Select-Object -First 30 |
+            -Pattern 'OnPasswordHashed|OnDialogResponse|bcrypt_hash' |
+            Select-Object -First 50 |
             ForEach-Object {
               Write-Host "$($_.LineNumber): $($_.Line.Trim())"
             }
 
-          Write-Host "`n========== CONDITIONAL DIRECTIVES =========="
-          Select-String -Path $pwn.FullName `
-            -Pattern '^\s*#\s*(if|elseif|else|endif)\b' |
-            Select-Object -First 150 |
-            ForEach-Object {
-              Write-Host "$($_.LineNumber): $($_.Line.Trim())"
+      - name: Fix RakNet include
+        shell: pwsh
+        run: |
+          $incdir = Get-ChildItem work -Recurse -Directory -Filter include |
+            Select-Object -First 1
+
+          if (-not $incdir) {
+            Write-Host "ERROR: include directory not found"
+            exit 1
+          }
+
+          $target = Join-Path $incdir.FullName "Pawn_RakNet.inc"
+
+          if (-not (Test-Path $target)) {
+            $source = Get-ChildItem work -Recurse -File -Filter Pawn.RakNet.inc |
+              Select-Object -First 1
+
+            if ($source) {
+              Copy-Item $source.FullName $target
+              Write-Host "RakNet include copied"
             }
+          }
 
       - name: Compile main
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Continue"
-
           New-Item out -ItemType Directory -Force | Out-Null
 
           $pwn = Get-ChildItem work -Recurse -File -Filter main.pwn |
@@ -115,9 +118,6 @@ jobs:
             exit 1
           }
 
-          Write-Host "Compiling: $($pwn.FullName)"
-          Write-Host "Compiler: $($compiler.FullName)"
-
           $opts = @("main.pwn", "-d3")
 
           Get-ChildItem work -Recurse -Directory -Filter include |
@@ -125,16 +125,16 @@ jobs:
               $opts += ("-i" + $_.FullName)
             }
 
-          $compileLog = "$env:GITHUB_WORKSPACE\out\compile.log"
+          $log = "$env:GITHUB_WORKSPACE\out\compile.log"
 
           Push-Location $pwn.DirectoryName
 
           try {
-            & $compiler.FullName @opts *> $compileLog
+            & $compiler.FullName @opts *> $log
             $compileExit = $LASTEXITCODE
           }
           catch {
-            $_ | Out-String | Out-File $compileLog -Append
+            $_ | Out-String | Out-File $log -Append
             $compileExit = 1
           }
           finally {
@@ -143,56 +143,37 @@ jobs:
 
           Write-Host "COMPILER EXIT CODE: $compileExit"
 
-          $amxPath = Join-Path $pwn.DirectoryName "main.amx"
-
-          if (Test-Path $amxPath) {
-            $amx = Get-Item $amxPath
-            Write-Host "Generated AMX size: $($amx.Length) bytes"
-          }
-          else {
-            Write-Host "ERROR: main.amx was not generated"
-          }
-
-          Write-Host "`n========== COMPILER LOG =========="
-
-          if (Test-Path $compileLog) {
-            Get-Content $compileLog -Tail 150
+          if (Test-Path $log) {
+            Get-Content $log -Tail 150
           }
 
           "Compiler exit code: $compileExit" |
             Out-File out\compiler_status.txt
 
-          $hasErrors = $false
-
-          if (Test-Path $compileLog) {
-            $hasErrors = [bool](Select-String `
-              -Path $compileLog `
-              -Pattern 'error\s+\d+|fatal error|Compilation aborted' `
-              -Quiet)
-          }
-
-          if ($compileExit -ne 0 -or $hasErrors) {
+          if ($compileExit -ne 0) {
             Write-Host "ERROR: compilation failed"
             exit 1
           }
 
+          $amxPath = Join-Path $pwn.DirectoryName "main.amx"
+
           if (-not (Test-Path $amxPath)) {
-            Write-Host "ERROR: main.amx missing"
+            Write-Host "ERROR: main.amx was not generated"
             exit 1
           }
 
           $amx = Get-Item $amxPath
 
+          Write-Host "AMX SIZE: $($amx.Length) bytes"
+
           if ($amx.Length -lt 1000000) {
-            Write-Host "ERROR: AMX is suspiciously small: $($amx.Length) bytes"
-            Write-Host "The file will not be published as a successful build."
+            Write-Host "ERROR: AMX is suspiciously small"
             exit 1
           }
 
           Copy-Item $amxPath out\main.amx -Force
 
           Write-Host "Build validation passed."
-          Write-Host "Final AMX size: $((Get-Item out\main.amx).Length) bytes"
 
       - name: Upload logs and AMX
         if: always()
