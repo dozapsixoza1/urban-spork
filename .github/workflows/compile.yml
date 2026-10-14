@@ -24,8 +24,6 @@ jobs:
           New-Item -ItemType Directory -Force work | Out-Null
           New-Item -ItemType Directory -Force out | Out-Null
 
-          Write-Host "Workspace prepared."
-
       - name: Extract source archive
         shell: pwsh
         run: |
@@ -37,13 +35,14 @@ jobs:
           }
 
           Write-Host "Archive: $($archive.FullName)"
+          Write-Host "Archive size: $($archive.Length) bytes"
 
           Expand-Archive `
             -Path $archive.FullName `
             -DestinationPath "$env:GITHUB_WORKSPACE\work" `
             -Force
 
-          Write-Host "Source extracted."
+          Write-Host "Source archive extracted."
 
       - name: Install Visual C++ Redistributables
         shell: pwsh
@@ -51,8 +50,8 @@ jobs:
           choco install vcredist-all -y --no-progress
 
           if ($LASTEXITCODE -ne 0) {
-            Write-Host "WARNING: Redistributable installation returned an error."
-            Write-Host "Continuing with existing system libraries."
+            Write-Host "WARNING: Redistributable installation returned code $LASTEXITCODE."
+            Write-Host "Continuing to test the compiler."
           }
 
       - name: Locate compiler and source
@@ -90,18 +89,18 @@ jobs:
             Select-Object -First 1
 
           if (-not $compiler) {
-            Write-Host "pawncc.exe not found."
-            exit 0
+            throw "pawncc.exe was not found."
           }
 
-          Write-Host "COMPILER DIRECTORY:"
+          Write-Host "========== COMPILER DIRECTORY =========="
+
           Get-ChildItem $compiler.DirectoryName -File |
             ForEach-Object {
               Write-Host "$($_.Name) ($($_.Length) bytes)"
             }
 
           Write-Host ""
-          Write-Host "TESTING COMPILER STARTUP"
+          Write-Host "========== COMPILER STARTUP TEST =========="
 
           Push-Location $compiler.DirectoryName
 
@@ -113,10 +112,6 @@ jobs:
 
             $testExit = $LASTEXITCODE
           }
-          catch {
-            Write-Host "Startup exception: $_"
-            $testExit = 1
-          }
           finally {
             Pop-Location
           }
@@ -124,16 +119,14 @@ jobs:
           Write-Host "STARTUP TEST EXIT CODE: $testExit"
 
           if ($testExit -eq 3) {
-            Write-Host "OK: Compiler started and printed its usage."
+            Write-Host "Compiler started successfully."
           }
           elseif ($testExit -eq -1073741515) {
-            Write-Host "WARNING: Windows reported a missing DLL."
+            Write-Host "WARNING: Compiler startup failed with a missing-DLL error."
           }
           else {
-            Write-Host "Startup test finished with code $testExit."
+            Write-Host "Compiler startup test returned $testExit."
           }
-
-          Write-Host "Diagnostic completed; continuing workflow."
 
       - name: Discover include directories
         shell: pwsh
@@ -185,7 +178,7 @@ jobs:
           }
 
           Write-Host ""
-          Write-Host "RakNet include candidates:"
+          Write-Host "========== RAKNET INCLUDE FILES =========="
 
           if ($raknetFiles) {
             foreach ($file in $raknetFiles) {
@@ -193,7 +186,7 @@ jobs:
             }
           }
           else {
-            Write-Host "No matching RakNet include file found."
+            Write-Host "No matching Pawn.RakNet include was found."
           }
 
       - name: Diagnose invalid Pawn character constants
@@ -204,8 +197,7 @@ jobs:
             Select-Object -First 1
 
           if (-not $pwn) {
-            Write-Host "main.pwn was not found."
-            exit 0
+            throw "main.pwn was not found."
           }
 
           $lines = [System.IO.File]::ReadAllLines($pwn.FullName)
@@ -236,9 +228,8 @@ jobs:
       - name: Compile main
         id: compile
         shell: pwsh
-        continue-on-error: true
         run: |
-          $ErrorActionPreference = "Continue"
+          $ErrorActionPreference = "Stop"
 
           New-Item -ItemType Directory -Force out | Out-Null
 
@@ -248,12 +239,12 @@ jobs:
           $compiler = Get-ChildItem work -Recurse -File -Filter pawncc.exe |
             Select-Object -First 1
 
-          if (-not $pwn -or -not $compiler) {
-            "Source or compiler not found." |
-              Set-Content out\compile.log -Encoding utf8
+          if (-not $pwn) {
+            throw "main.pwn was not found."
+          }
 
-            "1" | Set-Content out\compiler_status.txt -Encoding utf8
-            exit 0
+          if (-not $compiler) {
+            throw "pawncc.exe was not found."
           }
 
           $log = Join-Path $env:GITHUB_WORKSPACE "out\compile.log"
@@ -284,10 +275,6 @@ jobs:
             & $compiler.FullName @arguments *> $log
             $compileExit = $LASTEXITCODE
           }
-          catch {
-            $_ | Out-String | Out-File $log -Append
-            $compileExit = 1
-          }
           finally {
             Pop-Location
           }
@@ -302,31 +289,30 @@ jobs:
           }
 
           if ($compileExit -eq -1073741515) {
-            Add-Content $log ""
-            Add-Content $log "ERROR: Windows could not load a required DLL."
-            Write-Host "Compiler failed to load a required DLL."
-            exit 0
+            throw "Compiler failed to load a required DLL."
           }
 
           if ($compileExit -ne 0) {
-            Write-Host "Pawn compilation failed."
-            exit 0
+            throw "Pawn compilation failed with exit code $compileExit."
           }
 
           $amxPath = Join-Path $pwn.DirectoryName "main.amx"
 
           if (-not (Test-Path $amxPath)) {
-            Add-Content $log "ERROR: main.amx was not generated."
-            exit 0
+            throw "Compilation succeeded but main.amx was not created."
           }
 
           $amx = Get-Item $amxPath
 
           Write-Host "AMX SIZE: $($amx.Length) bytes"
 
+          if ($amx.Length -lt 100000) {
+            throw "main.amx is suspiciously small. Refusing to publish."
+          }
+
           Copy-Item $amxPath out\main.amx -Force
 
-          Write-Host "AMX copied to out\main.amx"
+          Write-Host "Validated AMX copied to out\main.amx."
 
       - name: Upload build results and diagnostics
         if: always()
