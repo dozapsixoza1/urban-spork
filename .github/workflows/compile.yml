@@ -16,15 +16,14 @@ jobs:
         shell: pwsh
         run: |
           if (-not (Test-Path 'src.zip')) {
-            Write-Host 'ERROR: src.zip not found in repository root'
+            Write-Host 'ERROR: src.zip not found'
             exit 1
           }
 
           Expand-Archive -Path src.zip -DestinationPath work -Force
           New-Item out -ItemType Directory -Force | Out-Null
-          Write-Host 'Source archive extracted.'
 
-      - name: Prepare source and locate compiler
+      - name: Locate compiler and repair include paths
         shell: pwsh
         run: |
           $pwn = Get-ChildItem work -Recurse -File -Filter main.pwn |
@@ -35,10 +34,10 @@ jobs:
             exit 1
           }
 
-          $preferred = Join-Path $pwn.DirectoryName 'pawncc.exe'
+          $compilerPath = Join-Path $pwn.DirectoryName 'pawncc.exe'
 
-          if (Test-Path $preferred) {
-            $compiler = Get-Item $preferred
+          if (Test-Path $compilerPath) {
+            $compiler = Get-Item $compilerPath
           } else {
             $compiler = Get-ChildItem work -Recurse -File -Filter pawncc.exe |
               Select-Object -First 1
@@ -48,87 +47,57 @@ jobs:
             Write-Host 'ERROR: pawncc.exe not found'
             exit 1
           }
-
-          $removed = 0
-
-          Get-ChildItem work -Recurse -File |
-            Where-Object { $_.Extension -in @('.pwn', '.inc') } |
-            ForEach-Object {
-              $file = $_
-              $bytes = [IO.File]::ReadAllBytes($file.FullName)
-
-              if ($bytes -contains 26) {
-                $clean = [Collections.Generic.List[byte]]::new()
-
-                foreach ($b in $bytes) {
-                  if ($b -eq 26) {
-                    $removed++
-                  } else {
-                    $clean.Add($b)
-                  }
-                }
-
-                [IO.File]::WriteAllBytes(
-                  $file.FullName,
-                  $clean.ToArray()
-                )
-
-                Write-Host "Removed Ctrl-Z bytes from $($file.FullName)"
-              }
-            }
-
-          "SOURCE=$($pwn.FullName)" |
-            Set-Content out\paths.txt
-
-          "COMPILER=$($compiler.FullName)" |
-            Add-Content out\paths.txt
-
-          "Ctrl-Z bytes removed: $removed" |
-            Set-Content out\source_bytes.txt
 
           Write-Host "SOURCE: $($pwn.FullName)"
-          Write-Host "SOURCE SIZE: $((Get-Item $pwn.FullName).Length) bytes"
           Write-Host "COMPILER: $($compiler.FullName)"
-          Write-Host "Ctrl-Z bytes removed: $removed"
 
-      - name: Install Visual C++ 2010 Runtime
-        shell: pwsh
-        run: |
-          choco install vcredist2010 -y --no-progress
+          Write-Host 'Searching for Pawn_RakNet include files...'
 
-          Write-Host "Chocolatey exit code: $LASTEXITCODE"
+          $allFiles = Get-ChildItem work -Recurse -File
 
-          # Runtime installation is best-effort.
-          exit 0
+          $raknetFiles = $allFiles | Where-Object {
+            $_.BaseName -ieq 'Pawn_RakNet' -or
+            $_.BaseName -ieq 'Pawn.RakNet' -or
+            $_.BaseName -ieq 'PawnRakNet'
+          }
 
-      - name: Prepare compiler DLL search path
-        shell: pwsh
-        run: |
-          $pwn = Get-ChildItem work -Recurse -File -Filter main.pwn |
-            Select-Object -First 1
+          foreach ($file in $raknetFiles) {
+            Write-Host "Candidate: $($file.FullName)"
+          }
 
-          $preferred = Join-Path $pwn.DirectoryName 'pawncc.exe'
+          $includeDirs = @(
+            Get-ChildItem work -Recurse -Directory |
+              Where-Object { $_.Name -ieq 'include' } |
+              ForEach-Object { $_.FullName }
+          )
 
-          if (Test-Path $preferred) {
-            $compiler = Get-Item $preferred
-          } else {
-            $compiler = Get-ChildItem work -Recurse -File -Filter pawncc.exe |
+          $includeDirs += $raknetFiles |
+            ForEach-Object { $_.DirectoryName }
+
+          $includeDirs += $pwn.DirectoryName
+          $includeDirs = $includeDirs | Sort-Object -Unique
+
+          $expected = Join-Path $pwn.DirectoryName 'Pawn_RakNet.inc'
+
+          if (-not (Test-Path $expected)) {
+            $candidate = $raknetFiles |
+              Where-Object { $_.Extension -ieq '.inc' } |
               Select-Object -First 1
-          }
 
-          if (-not $compiler) {
-            Write-Host 'ERROR: pawncc.exe not found'
-            exit 1
-          }
-
-          $dllFiles = Get-ChildItem work -Recurse -File -Filter '*.dll'
-
-          foreach ($dll in $dllFiles) {
-            $destination = Join-Path $compiler.DirectoryName $dll.Name
-
-            if (-not (Test-Path $destination)) {
-              Copy-Item $dll.FullName $destination -Force
+            if ($candidate) {
+              Copy-Item $candidate.FullName $expected -Force
+              Write-Host "Created include alias: $expected"
             }
+          }
+
+          $includeDirs | Set-Content out\include_dirs.txt
+
+          Write-Host 'Include directories:'
+          $includeDirs | ForEach-Object { Write-Host $_ }
+
+          if (-not (Test-Path $expected)) {
+            Write-Host 'WARNING: Pawn_RakNet.inc was not found in the archive.'
+            Write-Host 'The include may be missing entirely.'
           }
 
           $dllDirs = Get-ChildItem work -Recurse -File -Filter '*.dll' |
@@ -143,57 +112,41 @@ jobs:
             $env:PATH
           )
 
-          $env:PATH | Set-Content out\dll_search_path.txt
+          "SOURCE=$($pwn.FullName)" | Set-Content out\paths.txt
+          "COMPILER=$($compiler.FullName)" | Add-Content out\paths.txt
 
-          Write-Host "Compiler: $($compiler.FullName)"
-          Write-Host "DLL files found in archive: $($dllFiles.Count)"
-
-          foreach ($name in @('MSVCR100.dll', 'PAWNC.dll')) {
-            $found = Get-ChildItem work -Recurse -File -Filter $name `
-              -ErrorAction SilentlyContinue
-
-            if ($found) {
-              $found | ForEach-Object {
-                Write-Host "FOUND $name : $($_.FullName)"
-              }
-            } else {
-              Write-Host "NOT FOUND IN ARCHIVE: $name"
-            }
-          }
-
-      - name: Test compiler startup
+      - name: Remove Ctrl-Z bytes
         shell: pwsh
         run: |
-          $pwn = Get-ChildItem work -Recurse -File -Filter main.pwn |
-            Select-Object -First 1
+          Get-ChildItem work -Recurse -File |
+            Where-Object { $_.Extension -in @('.pwn', '.inc') } |
+            ForEach-Object {
+              $file = $_
+              $bytes = [IO.File]::ReadAllBytes($file.FullName)
 
-          $preferred = Join-Path $pwn.DirectoryName 'pawncc.exe'
+              if ($bytes -contains 26) {
+                $clean = [Collections.Generic.List[byte]]::new()
 
-          if (Test-Path $preferred) {
-            $compiler = Get-Item $preferred
-          } else {
-            $compiler = Get-ChildItem work -Recurse -File -Filter pawncc.exe |
-              Select-Object -First 1
-          }
+                foreach ($b in $bytes) {
+                  if ($b -ne 26) {
+                    $clean.Add($b)
+                  }
+                }
 
-          $testLog = Join-Path $env:GITHUB_WORKSPACE 'out\compiler_test.log'
+                [IO.File]::WriteAllBytes(
+                  $file.FullName,
+                  $clean.ToArray()
+                )
 
-          Push-Location $compiler.DirectoryName
+                Write-Host "Cleaned $($file.FullName)"
+              }
+            }
 
-          try {
-            & $compiler.FullName *> $testLog
-            $testExit = $LASTEXITCODE
-          } finally {
-            Pop-Location
-          }
-
-          Write-Host "Compiler startup test exit code: $testExit"
-          Write-Host 'Exit code 3 is expected when no source file is supplied.'
-
-          "Compiler startup test exit code: $testExit" |
-            Set-Content out\compiler_diagnostics.txt
-
-          # Exit code 3 is expected for the startup test.
+      - name: Install Visual C++ 2010 Runtime
+        shell: pwsh
+        run: |
+          choco install vcredist2010 -y --no-progress
+          Write-Host "Runtime installation exit code: $LASTEXITCODE"
           exit 0
 
       - name: Compile main
@@ -207,10 +160,10 @@ jobs:
             exit 1
           }
 
-          $preferred = Join-Path $pwn.DirectoryName 'pawncc.exe'
+          $compilerPath = Join-Path $pwn.DirectoryName 'pawncc.exe'
 
-          if (Test-Path $preferred) {
-            $compiler = Get-Item $preferred
+          if (Test-Path $compilerPath) {
+            $compiler = Get-Item $compilerPath
           } else {
             $compiler = Get-ChildItem work -Recurse -File -Filter pawncc.exe |
               Select-Object -First 1
@@ -233,15 +186,15 @@ jobs:
             $env:PATH
           )
 
-          $includeDirs = Get-ChildItem work -Recurse -Directory -Filter include
-
-          $argsList = @(
-            $pwn.FullName,
-            '-d3'
+          $includeDirs = @(
+            Get-Content out\include_dirs.txt |
+              Where-Object { $_ -and (Test-Path $_) }
           )
 
+          $argsList = @($pwn.FullName, '-d3')
+
           foreach ($inc in $includeDirs) {
-            $argsList += "-i$($inc.FullName)"
+            $argsList += "-i$inc"
           }
 
           $log = Join-Path $env:GITHUB_WORKSPACE 'out\compile.log'
@@ -249,7 +202,6 @@ jobs:
           Write-Host "COMPILING SOURCE: $($pwn.FullName)"
           Write-Host "USING COMPILER: $($compiler.FullName)"
           Write-Host "INCLUDE DIRECTORIES: $($includeDirs.Count)"
-          Write-Host "DLL DIRECTORIES: $($dllDirs.Count)"
 
           Push-Location $compiler.DirectoryName
 
@@ -264,55 +216,9 @@ jobs:
           }
 
           Write-Host "COMPILER EXIT CODE: $compileExit"
-
-          if (Test-Path $log) {
-            Get-Content $log -Tail 300
-          }
-
-          "Compiler exit code: $compileExit" |
-            Set-Content out\compiler_status.txt
+          Get-Content $log -Tail 300
 
           if ($compileExit -ne 0) {
-            $logText = Get-Content $log -Raw
-
-            $lineNumbers = [regex]::Matches(
-              $logText,
-              'main\.pwn\((\d+)\)\s*:\s*error'
-            ) |
-              ForEach-Object { [int]$_.Groups[1].Value } |
-              Sort-Object -Unique
-
-            $sourceLines = Get-Content $pwn.FullName
-            $context = [Collections.Generic.List[string]]::new()
-
-            foreach ($lineNo in $lineNumbers) {
-              $start = [Math]::Max(1, $lineNo - 4)
-              $end = [Math]::Min($sourceLines.Count, $lineNo + 4)
-
-              $context.Add(
-                "===== main.pwn lines $start-$end (error line $lineNo) ====="
-              )
-
-              for ($i = $start; $i -le $end; $i++) {
-                $context.Add(
-                  ('{0}: {1}' -f $i, $sourceLines[$i - 1])
-                )
-
-                if ($i -eq $lineNo) {
-                  $context.Add("     >>> ERROR LINE $lineNo <<<")
-                }
-              }
-            }
-
-            if ($context.Count -gt 0) {
-              $context | Set-Content out\error_context.txt
-
-              Write-Host '========== SOURCE CONTEXT AROUND ERRORS =========='
-              Get-Content out\error_context.txt
-            } else {
-              Write-Host 'Could not extract source error line numbers.'
-            }
-
             exit 1
           }
 
@@ -325,18 +231,17 @@ jobs:
 
           $amx = Get-Item $amxPath
 
-          Write-Host "GENERATED AMX SIZE: $($amx.Length) bytes"
+          Write-Host "AMX SIZE: $($amx.Length) bytes"
 
           if ($amx.Length -lt 1000000) {
-            Write-Host 'ERROR: AMX is suspiciously small; refusing to publish it.'
+            Write-Host 'ERROR: AMX is suspiciously small.'
             exit 1
           }
 
-          Copy-Item $amxPath 'out\main.amx' -Force
+          Copy-Item $amxPath out\main.amx -Force
+          Write-Host 'SUCCESS: main.amx copied to out.'
 
-          Write-Host 'SUCCESS: copied main.amx to out\main.amx'
-
-      - name: Upload logs and AMX
+      - name: Upload diagnostics and AMX
         if: always()
         uses: actions/upload-artifact@v4
         with:
