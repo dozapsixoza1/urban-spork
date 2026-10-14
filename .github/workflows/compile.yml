@@ -2,8 +2,6 @@ name: Compile Pawn
 on:
   workflow_dispatch:
   push:
-    paths:
-      - src.zip
 jobs:
   build:
     runs-on: windows-latest
@@ -13,16 +11,26 @@ jobs:
         shell: pwsh
         run: Expand-Archive -Path src.zip -DestinationPath work -Force
       - name: Compile
-        shell: cmd
+        shell: pwsh
         run: |
-          cd work\gamemodes
-          ..\pawno\pawncc.exe main.pwn -i..\pawno\include -i..\include -d3 > ..\..\compile.log 2>&1
-          type ..\..\compile.log
-          exit /b 0
+          New-Item out -ItemType Directory -Force | Out-Null
+          Get-ChildItem work -Recurse -Depth 3 | Select-Object -ExpandProperty FullName | Out-File out\tree.txt
+          $pwn = Get-ChildItem work -Recurse -Filter main.pwn | Sort-Object Length -Descending | Select-Object -First 1
+          $cc = Get-ChildItem work -Recurse -Filter pawncc.exe | Select-Object -First 1
+          if (-not $pwn) { "main.pwn NOT FOUND" | Tee-Object out\compile.log; exit 0 }
+          if (-not $cc) { "pawncc.exe NOT FOUND" | Tee-Object out\compile.log; exit 0 }
+          $opts = @("main.pwn", "-d3")
+          Get-ChildItem work -Recurse -Directory -Filter include | ForEach-Object { $opts += ("-i" + $_.FullName) }
+          Write-Host "main.pwn: $($pwn.FullName)"
+          Write-Host "pawncc: $($cc.FullName)"
+          Push-Location $pwn.DirectoryName
+          & $cc.FullName @opts *> "$env:GITHUB_WORKSPACE\out\compile.log"
+          Write-Host "exit code: $LASTEXITCODE"
+          Pop-Location
+          Get-Content out\compile.log -Tail 60
+          if (Test-Path "$($pwn.DirectoryName)\main.amx") { Copy-Item "$($pwn.DirectoryName)\main.amx" out\ }
       - name: Upload result
         uses: actions/upload-artifact@v4
         with:
           name: result
-          path: |
-            work/gamemodes/main.amx
-            compile.log
+          path: out
