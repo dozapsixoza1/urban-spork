@@ -12,6 +12,8 @@ jobs:
         run: Expand-Archive -Path src.zip -DestinationPath work -Force
       - name: Compile
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           New-Item out -ItemType Directory -Force | Out-Null
           Get-ChildItem work -Recurse -Depth 3 | Select-Object -ExpandProperty FullName | Out-File out\tree.txt
@@ -19,16 +21,32 @@ jobs:
           $cc = Get-ChildItem work -Recurse -Filter pawncc.exe | Select-Object -First 1
           if (-not $pwn) { "main.pwn NOT FOUND" | Tee-Object out\compile.log; exit 0 }
           if (-not $cc) { "pawncc.exe NOT FOUND" | Tee-Object out\compile.log; exit 0 }
+          $ccdir = $cc.DirectoryName
+          Get-ChildItem work -Recurse -Filter *.dll | ForEach-Object {
+            Write-Host "dll in archive: $($_.FullName)"
+            if (-not (Test-Path (Join-Path $ccdir $_.Name))) { Copy-Item $_.FullName $ccdir }
+          }
+          Write-Host "files next to pawncc:"
+          Get-ChildItem $ccdir | ForEach-Object { Write-Host "  $($_.Name)" }
           $opts = @("main.pwn", "-d3")
           Get-ChildItem work -Recurse -Directory -Filter include | ForEach-Object { $opts += ("-i" + $_.FullName) }
-          Write-Host "main.pwn: $($pwn.FullName)"
-          Write-Host "pawncc: $($cc.FullName)"
           Push-Location $pwn.DirectoryName
           & $cc.FullName @opts *> "$env:GITHUB_WORKSPACE\out\compile.log"
-          Write-Host "exit code: $LASTEXITCODE"
+          $code = $LASTEXITCODE
+          Write-Host "old pawncc exit code: $code"
+          if ($code -eq -1073741515) {
+            Write-Host "old pawncc cannot start, trying pawn-lang compiler"
+            gh release download -R pawn-lang/compiler -p "*windows.zip" -D "$env:GITHUB_WORKSPACE\newcc"
+            Get-ChildItem "$env:GITHUB_WORKSPACE\newcc\*.zip" | ForEach-Object { Expand-Archive $_.FullName "$env:GITHUB_WORKSPACE\newcc\x" -Force }
+            $cc2 = Get-ChildItem "$env:GITHUB_WORKSPACE\newcc" -Recurse -Filter pawncc.exe | Select-Object -First 1
+            Write-Host "new pawncc: $($cc2.FullName)"
+            & $cc2.FullName @opts *> "$env:GITHUB_WORKSPACE\out\compile.log"
+            $code = $LASTEXITCODE
+            Write-Host "new pawncc exit code: $code"
+          }
           Pop-Location
-          Get-Content out\compile.log -Tail 60
-          if (Test-Path "$($pwn.DirectoryName)\main.amx") { Copy-Item "$($pwn.DirectoryName)\main.amx" out\ }
+          Get-Content "$env:GITHUB_WORKSPACE\out\compile.log" -Tail 60
+          if (Test-Path "$($pwn.DirectoryName)\main.amx") { Copy-Item "$($pwn.DirectoryName)\main.amx" out\; Write-Host "main.amx OK" }
       - name: Upload result
         uses: actions/upload-artifact@v4
         with:
