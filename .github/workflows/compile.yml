@@ -9,7 +9,8 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Extract source
         shell: pwsh
@@ -21,7 +22,9 @@ jobs:
 
           Expand-Archive -Path src.zip -DestinationPath work -Force
 
-      - name: Diagnose source
+          Write-Host "Archive extracted."
+
+      - name: Locate compiler and source
         shell: pwsh
         run: |
           New-Item out -ItemType Directory -Force | Out-Null
@@ -32,74 +35,176 @@ jobs:
           $compiler = Get-ChildItem work -Recurse -File -Filter pawncc.exe |
             Select-Object -First 1
 
-          if (-not $pwn -or -not $compiler) {
-            Write-Host "ERROR: main.pwn or pawncc.exe not found"
+          if (-not $pwn) {
+            Write-Host "ERROR: main.pwn not found"
             exit 1
           }
 
-          Write-Host "MAIN: $($pwn.FullName)"
-          Write-Host "MAIN SIZE: $($pwn.Length) bytes"
+          if (-not $compiler) {
+            Write-Host "ERROR: pawncc.exe not found"
+            exit 1
+          }
+
+          "SOURCE=$($pwn.FullName)" |
+            Out-File out\paths.txt
+
+          "COMPILER=$($compiler.FullName)" |
+            Out-File out\paths.txt -Append
+
+          Write-Host "SOURCE: $($pwn.FullName)"
+          Write-Host "SOURCE SIZE: $($pwn.Length) bytes"
           Write-Host "COMPILER: $($compiler.FullName)"
+
+      - name: Fix RakNet include
+        shell: pwsh
+        run: |
+          $incdirs = Get-ChildItem work -Recurse -Directory -Filter include
+
+          foreach ($incdir in $incdirs) {
+            $target = Join-Path $incdir.FullName "Pawn_RakNet.inc"
+
+            if (-not (Test-Path $target)) {
+              $source = Get-ChildItem work -Recurse -File -Filter Pawn.RakNet.inc |
+                Select-Object -First 1
+
+              if ($source) {
+                Copy-Item $source.FullName $target
+                Write-Host "RakNet include copied to $target"
+                break
+              }
+            }
+          }
+
+      - name: Check source bytes
+        shell: pwsh
+        run: |
+          $files = Get-ChildItem work -Recurse -File |
+            Where-Object {
+              $_.Extension -in @(".pwn", ".inc")
+            }
+
+          $totalCtrlZ = 0
+
+          foreach ($file in $files) {
+            $bytes = [System.IO.File]::ReadAllBytes($file.FullName)
+
+            $count = 0
+
+            foreach ($b in $bytes) {
+              if ($b -eq 26) {
+                $count++
+              }
+            }
+
+            if ($count -gt 0) {
+              Write-Host "CTRL-Z bytes: $count : $($file.FullName)"
+              $totalCtrlZ += $count
+            }
+          }
+
+          Write-Host "TOTAL Ctrl-Z bytes found: $totalCtrlZ"
+
+          "Ctrl-Z bytes found: $totalCtrlZ" |
+            Out-File out\source_bytes.txt
+
+      - name: Diagnose main source
+        shell: pwsh
+        run: |
+          $pwn = Get-ChildItem work -Recurse -File -Filter main.pwn |
+            Select-Object -First 1
+
+          if (-not $pwn) {
+            Write-Host "ERROR: main.pwn not found"
+            exit 1
+          }
 
           $lines = Get-Content $pwn.FullName
 
+          Write-Host "`n========== FIRST 100 LINES =========="
+
+          for ($i = 1; $i -le [Math]::Min(100, $lines.Count); $i++) {
+            Write-Host ("{0}: {1}" -f $i, $lines[$i - 1])
+          }
+
           Write-Host "`n========== SOURCE AROUND main() =========="
 
-          $start = 640
-          $end = [Math]::Min(710, $lines.Count)
-
-          for ($i = $start; $i -le $end; $i++) {
+          for ($i = 640; $i -le [Math]::Min(710, $lines.Count); $i++) {
             Write-Host ("{0}: {1}" -f $i, $lines[$i - 1])
           }
 
           Write-Host "`n========== SOURCE AROUND OnGameModeInit =========="
 
-          $start = 8170
-          $end = [Math]::Min(8220, $lines.Count)
-
-          for ($i = $start; $i -le $end; $i++) {
+          for ($i = 8170; $i -le [Math]::Min(8225, $lines.Count); $i++) {
             Write-Host ("{0}: {1}" -f $i, $lines[$i - 1])
           }
-
-          Write-Host "`n========== COMMENT MARKERS =========="
-
-          Select-String -Path $pwn.FullName `
-            -Pattern '/\*|\*/' |
-            Select-Object -First 100 |
-            ForEach-Object {
-              Write-Host "$($_.LineNumber): $($_.Line.Trim())"
-            }
 
           Write-Host "`n========== REGISTRATION CALLBACKS =========="
 
           Select-String -Path $pwn.FullName `
             -Pattern 'OnPasswordHashed|OnDialogResponse|bcrypt_hash' |
-            Select-Object -First 50 |
+            Select-Object -First 60 |
             ForEach-Object {
               Write-Host "$($_.LineNumber): $($_.Line.Trim())"
             }
 
-      - name: Fix RakNet include
+      - name: Test Pawn compiler
         shell: pwsh
         run: |
-          $incdir = Get-ChildItem work -Recurse -Directory -Filter include |
+          $compiler = Get-ChildItem work -Recurse -File -Filter pawncc.exe |
             Select-Object -First 1
 
-          if (-not $incdir) {
-            Write-Host "ERROR: include directory not found"
+          if (-not $compiler) {
+            Write-Host "ERROR: pawncc.exe not found"
             exit 1
           }
 
-          $target = Join-Path $incdir.FullName "Pawn_RakNet.inc"
+          $probeDir = Join-Path $env:GITHUB_WORKSPACE "work\pawn_probe"
 
-          if (-not (Test-Path $target)) {
-            $source = Get-ChildItem work -Recurse -File -Filter Pawn.RakNet.inc |
-              Select-Object -First 1
+          New-Item $probeDir -ItemType Directory -Force | Out-Null
 
-            if ($source) {
-              Copy-Item $source.FullName $target
-              Write-Host "RakNet include copied"
-            }
+          $probe = @'
+          main()
+          {
+              print("Pawn compiler test passed");
+              return 1;
+          }
+          '@
+
+          $probePath = Join-Path $probeDir "probe.pwn"
+
+          Set-Content -Path $probePath -Value $probe -Encoding ascii
+
+          Push-Location $probeDir
+
+          try {
+            & $compiler.FullName "probe.pwn" "-d3" *> "$env:GITHUB_WORKSPACE\out\probe.log"
+            $probeExit = $LASTEXITCODE
+          }
+          finally {
+            Pop-Location
+          }
+
+          Write-Host "PROBE EXIT CODE: $probeExit"
+
+          Get-Content out\probe.log
+
+          if ($probeExit -ne 0) {
+            Write-Host "ERROR: compiler test failed"
+            exit 1
+          }
+
+          if (-not (Test-Path "$probeDir\probe.amx")) {
+            Write-Host "ERROR: test AMX was not created"
+            exit 1
+          }
+
+          $probeAmx = Get-Item "$probeDir\probe.amx"
+
+          Write-Host "TEST AMX SIZE: $($probeAmx.Length) bytes"
+
+          if ($probeAmx.Length -lt 100) {
+            Write-Host "ERROR: compiler test produced a suspiciously small AMX"
+            exit 1
           }
 
       - name: Compile main
@@ -114,18 +219,23 @@ jobs:
             Select-Object -First 1
 
           if (-not $pwn -or -not $compiler) {
-            Write-Host "ERROR: main.pwn or pawncc.exe not found"
+            Write-Host "ERROR: source or compiler not found"
             exit 1
           }
 
+          $includeDirs = Get-ChildItem work -Recurse -Directory -Filter include
+
           $opts = @("main.pwn", "-d3")
 
-          Get-ChildItem work -Recurse -Directory -Filter include |
-            ForEach-Object {
-              $opts += ("-i" + $_.FullName)
-            }
+          foreach ($inc in $includeDirs) {
+            $opts += "-i$($inc.FullName)"
+          }
 
-          $log = "$env:GITHUB_WORKSPACE\out\compile.log"
+          $log = Join-Path $env:GITHUB_WORKSPACE "out\compile.log"
+
+          Write-Host "Compiling: $($pwn.FullName)"
+          Write-Host "Compiler: $($compiler.FullName)"
+          Write-Host "Include directories: $($includeDirs.Count)"
 
           Push-Location $pwn.DirectoryName
 
@@ -144,18 +254,18 @@ jobs:
           Write-Host "COMPILER EXIT CODE: $compileExit"
 
           if (Test-Path $log) {
-            Get-Content $log -Tail 150
+            Get-Content $log -Tail 200
           }
 
           "Compiler exit code: $compileExit" |
             Out-File out\compiler_status.txt
 
+          $amxPath = Join-Path $pwn.DirectoryName "main.amx"
+
           if ($compileExit -ne 0) {
-            Write-Host "ERROR: compilation failed"
+            Write-Host "ERROR: compiler returned a nonzero exit code"
             exit 1
           }
-
-          $amxPath = Join-Path $pwn.DirectoryName "main.amx"
 
           if (-not (Test-Path $amxPath)) {
             Write-Host "ERROR: main.amx was not generated"
@@ -164,16 +274,18 @@ jobs:
 
           $amx = Get-Item $amxPath
 
-          Write-Host "AMX SIZE: $($amx.Length) bytes"
+          Write-Host "GENERATED AMX SIZE: $($amx.Length) bytes"
 
           if ($amx.Length -lt 1000000) {
-            Write-Host "ERROR: AMX is suspiciously small"
+            Write-Host "ERROR: main.amx is suspiciously small"
+            Write-Host "The compiler may have skipped most of the source."
             exit 1
           }
 
           Copy-Item $amxPath out\main.amx -Force
 
-          Write-Host "Build validation passed."
+          Write-Host "AMX copied to artifacts."
+          Write-Host "FINAL AMX SIZE: $((Get-Item out\main.amx).Length) bytes"
 
       - name: Upload logs and AMX
         if: always()
