@@ -1,0 +1,28 @@
+name: Compile Pawn
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - src.zip
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unzip sources
+        shell: pwsh
+        run: Expand-Archive -Path src.zip -DestinationPath work -Force
+      - name: Compile
+        shell: cmd
+        run: |
+          cd work\gamemodes
+          ..\pawno\pawncc.exe main.pwn -i..\pawno\include -i..\include -d3 > ..\..\compile.log 2>&1
+          type ..\..\compile.log
+          exit /b 0
+      - name: Upload result
+        uses: actions/upload-artifact@v4
+        with:
+          name: result
+          path: |
+            work/gamemodes/main.amx
+            compile.log
