@@ -14,18 +14,34 @@ jobs:
       - name: Unzip
         shell: pwsh
         run: Expand-Archive -Path src.zip -DestinationPath work -Force
-      - name: Check includes
+      - name: RakNet include fix
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          $need = 'a_samp','crashdetect','log-plugin','a_mysql','fdialog','a_mail','streamer','pawncmd','sscanf2','foreach','strlib','Pawn_RakNet','time_t','timerfix','TOTP','bcrypt','player_geolocation','zvehcomp','voicechat','customhud','customtune','rustext','mapfix','color'
-          $have = Get-ChildItem work -Recurse -Filter *.inc | ForEach-Object { $_.BaseName.ToLower() }
-          $miss = $need | Where-Object { $have -notcontains $_.ToLower() }
-          Write-Host "MISSING INCLUDES: $($miss -join ', ')"
-          New-Item out -ItemType Directory -Force | Out-Null
-          Get-ChildItem work -Recurse -Filter *.inc | Select-Object -ExpandProperty FullName | Out-File out\inc_list.txt
+          $has = Get-ChildItem work -Recurse -Filter Pawn_RakNet.inc
+          $incdir = Get-ChildItem work -Recurse -Directory -Filter include | Select-Object -First 1
+          if ($has) { Write-Host "Pawn_RakNet.inc already present" }
+          else {
+            $dot = Get-ChildItem work -Recurse -Filter Pawn.RakNet.inc | Select-Object -First 1
+            if ($dot) {
+              Copy-Item $dot.FullName (Join-Path $incdir.FullName "Pawn_RakNet.inc")
+              Write-Host "copied Pawn.RakNet.inc as Pawn_RakNet.inc"
+            } else {
+              gh release download 1.6.0 -R katursis/Pawn.RakNet -D rn
+              Get-ChildItem rn | ForEach-Object { Write-Host "asset: $($_.Name)" }
+              Get-ChildItem rn -Filter *.zip | ForEach-Object { Expand-Archive $_.FullName rn\x -Force }
+              $f = Get-ChildItem rn -Recurse -Filter Pawn.RakNet.inc | Select-Object -First 1
+              if ($f) {
+                Copy-Item $f.FullName (Join-Path $incdir.FullName "Pawn_RakNet.inc")
+                Write-Host "downloaded official include as Pawn_RakNet.inc"
+              } else { Write-Host "RAKNET INC NOT FOUND" }
+            }
+          }
       - name: Compile
         shell: pwsh
         run: |
+          New-Item out -ItemType Directory -Force | Out-Null
           $pwn = Get-ChildItem work -Recurse -Filter main.pwn | Sort-Object Length -Descending | Select-Object -First 1
           $cc = Get-ChildItem work -Recurse -Filter pawncc.exe | Select-Object -First 1
           $opts = @("main.pwn", "-d3")
