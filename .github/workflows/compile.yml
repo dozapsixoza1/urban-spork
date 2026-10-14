@@ -16,8 +16,7 @@ jobs:
         shell: pwsh
         run: |
           if (-not (Test-Path "src.zip")) {
-            Write-Host "ERROR: src.zip not found in repository root"
-            Get-ChildItem -Force | Select-Object Name
+            Write-Host "ERROR: src.zip not found"
             exit 1
           }
 
@@ -29,26 +28,35 @@ jobs:
         run: |
           New-Item out -ItemType Directory -Force | Out-Null
 
-          $pwn = Get-ChildItem work -Recurse -File -Filter main.pwn | Select-Object -First 1
-          $compiler = Get-ChildItem work -Recurse -File -Filter pawncc.exe | Select-Object -First 1
+          $pwn = Get-ChildItem work -Recurse -File -Filter main.pwn |
+            Select-Object -First 1
 
-          if (-not $pwn) { Write-Host "ERROR: main.pwn not found"; exit 1 }
-          if (-not $compiler) { Write-Host "ERROR: pawncc.exe not found"; exit 1 }
+          $compiler = Get-ChildItem work -Recurse -File -Filter pawncc.exe |
+            Select-Object -First 1
+
+          if (-not $pwn) {
+            Write-Host "ERROR: main.pwn not found"
+            exit 1
+          }
+
+          if (-not $compiler) {
+            Write-Host "ERROR: pawncc.exe not found"
+            exit 1
+          }
 
           Write-Host "SOURCE: $($pwn.FullName)"
           Write-Host "SOURCE SIZE: $($pwn.Length) bytes"
           Write-Host "COMPILER: $($compiler.FullName)"
-          Write-Host "COMPILER DIRECTORY: $($compiler.DirectoryName)"
 
           "SOURCE=$($pwn.FullName)" | Out-File out\paths.txt
-          "COMPILER=$($compiler.FullName)" | Out-File out\paths.txt -Append
+          "COMPILER=$($compiler.FullName)" |
+            Out-File out\paths.txt -Append
 
       - name: Remove Ctrl-Z bytes from Pawn sources
         shell: pwsh
         run: |
-          $files = Get-ChildItem work -Recurse -File | Where-Object {
-            $_.Extension -in @('.pwn', '.inc')
-          }
+          $files = Get-ChildItem work -Recurse -File |
+            Where-Object { $_.Extension -in @('.pwn', '.inc') }
 
           $foundTotal = 0
           $removedTotal = 0
@@ -58,12 +66,13 @@ jobs:
             $count = 0
 
             foreach ($b in $bytes) {
-              if ($b -eq 26) { $count++ }
+              if ($b -eq 26) {
+                $count++
+              }
             }
 
             if ($count -gt 0) {
               $foundTotal += $count
-
               $clean = [System.Collections.Generic.List[byte]]::new()
 
               foreach ($b in $bytes) {
@@ -78,7 +87,6 @@ jobs:
               )
 
               $removedTotal += $count
-
               Write-Host "Removed $count Ctrl-Z byte(s): $($file.FullName)"
             }
           }
@@ -95,14 +103,16 @@ jobs:
       - name: Fix RakNet include filename if needed
         shell: pwsh
         run: |
-          $targetFiles = Get-ChildItem work -Recurse -File -Filter Pawn_RakNet.inc
+          $targetFiles = Get-ChildItem work -Recurse -File `
+            -Filter Pawn_RakNet.inc
 
           if ($targetFiles.Count -eq 0) {
             $source = Get-ChildItem work -Recurse -File |
               Where-Object { $_.Name -ieq 'Pawn.RakNet.inc' } |
               Select-Object -First 1
 
-            $includeDir = Get-ChildItem work -Recurse -Directory -Filter include |
+            $includeDir = Get-ChildItem work -Recurse -Directory `
+              -Filter include |
               Select-Object -First 1
 
             if ($source -and $includeDir) {
@@ -112,7 +122,7 @@ jobs:
               Write-Host "RakNet include copied."
             }
             else {
-              Write-Host "No alternate RakNet include filename found; continuing."
+              Write-Host "No alternate RakNet include found."
             }
           }
           else {
@@ -150,7 +160,69 @@ jobs:
             -Pattern '^\s*main\s*\(|OnGameModeInit|OnPasswordHashed|bcrypt_hash' |
             Select-Object -First 80 |
             ForEach-Object {
-              Write-Host ("{0}: {1}" -f $_.LineNumber, $_.Line.Trim())
+              Write-Host "$($_.LineNumber): $($_.Line.Trim())"
+            }
+
+      - name: Prepare compiler DLL dependencies
+        shell: pwsh
+        run: |
+          New-Item out -ItemType Directory -Force | Out-Null
+
+          $compiler = Get-ChildItem work -Recurse -File `
+            -Filter pawncc.exe |
+            Select-Object -First 1
+
+          if (-not $compiler) {
+            Write-Host "ERROR: pawncc.exe not found"
+            exit 1
+          }
+
+          $compilerDir = $compiler.DirectoryName
+
+          Write-Host "COMPILER DIRECTORY: $compilerDir"
+
+          $dllFiles = Get-ChildItem work -Recurse -File -Filter *.dll
+
+          $dllDirs = $dllFiles |
+            ForEach-Object { $_.DirectoryName } |
+            Sort-Object -Unique
+
+          $env:PATH = (
+            ($dllDirs -join ';') +
+            ';' + $compilerDir +
+            ';' + $env:PATH
+          )
+
+          $env:PATH | Out-File out\dll_search_path.txt
+
+          Write-Host "DLL FILES FOUND: $($dllFiles.Count)"
+          Write-Host "DLL DIRECTORIES: $($dllDirs.Count)"
+
+          $copied = 0
+
+          foreach ($dll in $dllFiles) {
+            $destination = Join-Path $compilerDir $dll.Name
+
+            if (-not (Test-Path $destination)) {
+              try {
+                Copy-Item $dll.FullName $destination -ErrorAction Stop
+                $copied++
+
+                Write-Host "Copied dependency: $($dll.Name)"
+              }
+              catch {
+                Write-Host "Could not copy $($dll.Name)"
+                Write-Host $_.Exception.Message
+              }
+            }
+          }
+
+          Write-Host "DLLS COPIED: $copied"
+          Write-Host "========== COMPILER DLLS =========="
+
+          Get-ChildItem $compilerDir -File -Filter *.dll |
+            ForEach-Object {
+              Write-Host "$($_.Name) ($($_.Length) bytes)"
             }
 
       - name: Compile main
@@ -161,7 +233,8 @@ jobs:
           $pwn = Get-ChildItem work -Recurse -File -Filter main.pwn |
             Select-Object -First 1
 
-          $compiler = Get-ChildItem work -Recurse -File -Filter pawncc.exe |
+          $compiler = Get-ChildItem work -Recurse -File `
+            -Filter pawncc.exe |
             Select-Object -First 1
 
           if (-not $pwn) {
@@ -174,7 +247,18 @@ jobs:
             exit 1
           }
 
-          $includeDirs = Get-ChildItem work -Recurse -Directory -Filter include
+          $dllDirs = Get-ChildItem work -Recurse -File -Filter *.dll |
+            ForEach-Object { $_.DirectoryName } |
+            Sort-Object -Unique
+
+          $env:PATH = (
+            ($dllDirs -join ';') +
+            ';' + $compiler.DirectoryName +
+            ';' + $env:PATH
+          )
+
+          $includeDirs = Get-ChildItem work -Recurse -Directory `
+            -Filter include
 
           $argsList = @($pwn.FullName, '-d3')
 
@@ -187,9 +271,8 @@ jobs:
           Write-Host "COMPILING SOURCE: $($pwn.FullName)"
           Write-Host "USING COMPILER: $($compiler.FullName)"
           Write-Host "INCLUDE DIRECTORIES: $($includeDirs.Count)"
+          Write-Host "DLL DIRECTORIES: $($dllDirs.Count)"
 
-          # Запускаем компилятор из исходной папки,
-          # чтобы Windows могла найти необходимые DLL.
           Push-Location $compiler.DirectoryName
 
           try {
@@ -213,12 +296,16 @@ jobs:
           "Compiler exit code: $compileExit" |
             Out-File out\compiler_status.txt
 
-          $amxPath = Join-Path $pwn.DirectoryName 'main.amx'
-
           if ($compileExit -ne 0) {
-            Write-Host "ERROR: compiler returned a nonzero exit code"
+            if ($compileExit -eq -1073741515) {
+              Write-Host "ERROR 0xC0000135: required DLL is missing."
+              Write-Host "Inspect the DLL diagnostics in the artifact."
+            }
+
             exit 1
           }
+
+          $amxPath = Join-Path $pwn.DirectoryName 'main.amx'
 
           if (-not (Test-Path $amxPath)) {
             Write-Host "ERROR: main.amx was not generated"
@@ -230,7 +317,8 @@ jobs:
           Write-Host "GENERATED AMX SIZE: $($amx.Length) bytes"
 
           if ($amx.Length -lt 1000000) {
-            Write-Host "ERROR: main.amx is suspiciously small; refusing to publish it."
+            Write-Host "ERROR: AMX is suspiciously small."
+            Write-Host "Refusing to publish this file."
             exit 1
           }
 
