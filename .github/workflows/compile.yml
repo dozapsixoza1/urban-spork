@@ -27,16 +27,7 @@ jobs:
             if ($dot) {
               Copy-Item $dot.FullName (Join-Path $incdir.FullName "Pawn_RakNet.inc")
               Write-Host "copied Pawn.RakNet.inc as Pawn_RakNet.inc"
-            } else {
-              gh release download 1.6.0 -R katursis/Pawn.RakNet -D rn
-              Get-ChildItem rn | ForEach-Object { Write-Host "asset: $($_.Name)" }
-              Get-ChildItem rn -Filter *.zip | ForEach-Object { Expand-Archive $_.FullName rn\x -Force }
-              $f = Get-ChildItem rn -Recurse -Filter Pawn.RakNet.inc | Select-Object -First 1
-              if ($f) {
-                Copy-Item $f.FullName (Join-Path $incdir.FullName "Pawn_RakNet.inc")
-                Write-Host "downloaded official include as Pawn_RakNet.inc"
-              } else { Write-Host "RAKNET INC NOT FOUND" }
-            }
+            } else { Write-Host "RAKNET INC NOT FOUND" }
           }
       - name: Compile
         shell: pwsh
@@ -53,6 +44,26 @@ jobs:
           Get-Content "$env:GITHUB_WORKSPACE\out\compile.log" -Tail 60
           if (Test-Path "$($pwn.DirectoryName)\main.amx") { Copy-Item "$($pwn.DirectoryName)\main.amx" out\; Write-Host "main.amx OK" }
           exit 0
+      - name: Show error lines
+        shell: pwsh
+        run: |
+          $report = @()
+          $errs = Get-Content out\compile.log | Where-Object { $_ -match '^(.+?)\((\d+)\) : (error|fatal)' } | Select-Object -First 8
+          foreach ($e in $errs) {
+            if ($e -match '^(.+?)\((\d+)\) : ') {
+              $f = $Matches[1]
+              $n = [int]$Matches[2]
+              $rel = $f.Replace('\','/')
+              $p = Get-ChildItem work -Recurse -Filter (Split-Path $f -Leaf) | Where-Object { $_.FullName.Replace('\','/') -like "*$rel" } | Select-Object -First 1
+              $report += "=== $f line $n"
+              if ($p) {
+                $lines = Get-Content $p.FullName
+                for ($i = [Math]::Max(1, $n-3); $i -le [Math]::Min($lines.Count, $n+1); $i++) { $report += ("{0}: {1}" -f $i, $lines[$i-1]) }
+              } else { $report += "file not found in archive" }
+            }
+          }
+          $report | Out-File out\error_lines.txt
+          $report | ForEach-Object { Write-Host $_ }
       - name: Upload
         if: always()
         uses: actions/upload-artifact@v4
