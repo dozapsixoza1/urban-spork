@@ -3,52 +3,74 @@ on:
   workflow_dispatch:
   push:
 jobs:
-  build:
+  linux:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update -y
+          sudo apt-get install -y libc6:i386 libgcc-s1:i386 unzip
+          mkdir -p work newcc out
+          unzip -q src.zip -d work
+          find work -maxdepth 3 > out/tree.txt
+          gh release download -R pawn-lang/compiler -p "*linux.tar.gz" -D newcc
+          tar -xzf newcc/*.tar.gz -C newcc
+          find newcc -type f | head -20
+      - name: Compile
+        run: |
+          set +e
+          CC=$(find "$PWD/newcc" -name pawncc -type f | head -1)
+          LIB=$(dirname "$(find "$PWD/newcc" -name 'libpawnc.so*' | head -1)")
+          chmod +x "$CC"
+          PWN=$(find "$PWD/work" -name main.pwn -printf '%s %p\n' | sort -rn | head -1 | cut -d' ' -f2-)
+          INC=""
+          for d in $(find "$PWD/work" -type d -name include); do INC="$INC -i$d"; done
+          echo "pwn: $PWN"
+          cd "$(dirname "$PWN")"
+          LD_LIBRARY_PATH="$LIB" "$CC" main.pwn -d3 $INC > "$GITHUB_WORKSPACE/out/compile.log" 2>&1
+          echo "exit code: $?"
+          tail -n 60 "$GITHUB_WORKSPACE/out/compile.log"
+          if [ -f main.amx ]; then cp main.amx "$GITHUB_WORKSPACE/out/"; echo "main.amx OK"; fi
+          exit 0
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: result-linux
+          path: out
+  windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Unzip sources
+      - name: Install runtimes
+        shell: pwsh
+        continue-on-error: true
+        run: choco install vcredist2005 vcredist2008 vcredist2010 vcredist140 -y --no-progress
+      - name: Unzip
         shell: pwsh
         run: Expand-Archive -Path src.zip -DestinationPath work -Force
       - name: Compile
         shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           New-Item out -ItemType Directory -Force | Out-Null
-          Get-ChildItem work -Recurse -Depth 3 | Select-Object -ExpandProperty FullName | Out-File out\tree.txt
           $pwn = Get-ChildItem work -Recurse -Filter main.pwn | Sort-Object Length -Descending | Select-Object -First 1
           $cc = Get-ChildItem work -Recurse -Filter pawncc.exe | Select-Object -First 1
-          if (-not $pwn) { "main.pwn NOT FOUND" | Tee-Object out\compile.log; exit 0 }
-          if (-not $cc) { "pawncc.exe NOT FOUND" | Tee-Object out\compile.log; exit 0 }
-          $ccdir = $cc.DirectoryName
-          Get-ChildItem work -Recurse -Filter *.dll | ForEach-Object {
-            Write-Host "dll in archive: $($_.FullName)"
-            if (-not (Test-Path (Join-Path $ccdir $_.Name))) { Copy-Item $_.FullName $ccdir }
-          }
-          Write-Host "files next to pawncc:"
-          Get-ChildItem $ccdir | ForEach-Object { Write-Host "  $($_.Name)" }
           $opts = @("main.pwn", "-d3")
           Get-ChildItem work -Recurse -Directory -Filter include | ForEach-Object { $opts += ("-i" + $_.FullName) }
           Push-Location $pwn.DirectoryName
           & $cc.FullName @opts *> "$env:GITHUB_WORKSPACE\out\compile.log"
-          $code = $LASTEXITCODE
-          Write-Host "old pawncc exit code: $code"
-          if ($code -eq -1073741515) {
-            Write-Host "old pawncc cannot start, trying pawn-lang compiler"
-            gh release download -R pawn-lang/compiler -p "*windows.zip" -D "$env:GITHUB_WORKSPACE\newcc"
-            Get-ChildItem "$env:GITHUB_WORKSPACE\newcc\*.zip" | ForEach-Object { Expand-Archive $_.FullName "$env:GITHUB_WORKSPACE\newcc\x" -Force }
-            $cc2 = Get-ChildItem "$env:GITHUB_WORKSPACE\newcc" -Recurse -Filter pawncc.exe | Select-Object -First 1
-            Write-Host "new pawncc: $($cc2.FullName)"
-            & $cc2.FullName @opts *> "$env:GITHUB_WORKSPACE\out\compile.log"
-            $code = $LASTEXITCODE
-            Write-Host "new pawncc exit code: $code"
-          }
+          Write-Host "exit code: $LASTEXITCODE"
           Pop-Location
           Get-Content "$env:GITHUB_WORKSPACE\out\compile.log" -Tail 60
           if (Test-Path "$($pwn.DirectoryName)\main.amx") { Copy-Item "$($pwn.DirectoryName)\main.amx" out\; Write-Host "main.amx OK" }
-      - name: Upload result
+          exit 0
+      - name: Upload
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: result
+          name: result-windows
           path: out
