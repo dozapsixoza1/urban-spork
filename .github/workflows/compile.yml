@@ -1,228 +1,226 @@
-name: Compile Pawn
+name: Compile Pawn Mod
 
 on:
-  workflow_dispatch:
   push:
-    branches:
-      - main
-      - master
+  workflow_dispatch:
+  pull_request:
 
 permissions:
   contents: read
 
 jobs:
-  windows:
+  compile:
     runs-on: windows-latest
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Prepare directories
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force work | Out-Null
-          New-Item -ItemType Directory -Force out | Out-Null
-
       - name: Extract source archive
-        shell: pwsh
-        run: |
-          $archive = Get-ChildItem -Path . -Recurse -File -Filter src.zip |
-            Select-Object -First 1
-
-          if (-not $archive) {
-            throw "src.zip was not found."
-          }
-
-          Expand-Archive `
-            -Path $archive.FullName `
-            -DestinationPath "$env:GITHUB_WORKSPACE\work" `
-            -Force
-
-          Write-Host "Archive extracted: $($archive.FullName)"
-
-      - name: Locate compiler and source
-        shell: pwsh
-        run: |
-          $sources = @(Get-ChildItem work -Recurse -File -Filter main.pwn)
-          $compilers = @(Get-ChildItem work -Recurse -File -Filter pawncc.exe)
-
-          Write-Host "Found main.pwn files: $($sources.Count)"
-          Write-Host "Found pawncc.exe files: $($compilers.Count)"
-
-          foreach ($source in $sources) {
-            Write-Host "SOURCE: $($source.FullName)"
-            Write-Host "SIZE: $($source.Length) bytes"
-          }
-
-          if ($sources.Count -eq 0) {
-            throw "main.pwn not found."
-          }
-
-          if ($compilers.Count -eq 0) {
-            throw "pawncc.exe not found."
-          }
-
-          $pwn = $sources |
-            Sort-Object Length -Descending |
-            Select-Object -First 1
-
-          $compiler = $compilers |
-            Select-Object -First 1
-
-          "SOURCE=$($pwn.FullName)" |
-            Set-Content out\paths.txt -Encoding utf8
-
-          "COMPILER=$($compiler.FullName)" |
-            Add-Content out\paths.txt -Encoding utf8
-
-      - name: Diagnose Pawn source
-        shell: pwsh
-        run: |
-          $pwn = Get-ChildItem work -Recurse -File -Filter main.pwn |
-            Sort-Object Length -Descending |
-            Select-Object -First 1
-
-          if (-not $pwn) {
-            throw "main.pwn not found."
-          }
-
-          $lines = [System.IO.File]::ReadAllLines($pwn.FullName)
-
-          Write-Host "SOURCE: $($pwn.FullName)"
-          Write-Host "SOURCE SIZE: $($pwn.Length)"
-          Write-Host "SOURCE LINES: $($lines.Length)"
-
-          Write-Host ""
-          Write-Host "========== FIRST 100 LINES =========="
-
-          for ($i = 0; $i -lt [Math]::Min(100, $lines.Length); $i++) {
-            Write-Host ("{0}: {1}" -f ($i + 1), $lines[$i])
-          }
-
-          Write-Host ""
-          Write-Host "========== INCLUDE DIRECTIVES =========="
-
-          Select-String -Path $pwn.FullName `
-            -Pattern '^\s*#\s*include\b' |
-            ForEach-Object {
-              Write-Host "$($_.LineNumber): $($_.Line.Trim())"
-            }
-
-          Write-Host ""
-          Write-Host "========== PUBLIC CALLBACKS =========="
-
-          Select-String -Path $pwn.FullName `
-            -Pattern '^\s*public\s+[A-Za-z_][A-Za-z0-9_]*\s*\(' |
-            Select-Object -First 100 |
-            ForEach-Object {
-              Write-Host "$($_.LineNumber): $($_.Line.Trim())"
-            }
-
-      - name: Discover include directories
-        shell: pwsh
-        run: |
-          $pwn = Get-ChildItem work -Recurse -File -Filter main.pwn |
-            Sort-Object Length -Descending |
-            Select-Object -First 1
-
-          $directories = @($pwn.DirectoryName)
-
-          Get-ChildItem work -Recurse -Directory |
-            Where-Object { $_.Name -ieq "include" } |
-            ForEach-Object {
-              $directories += $_.FullName
-            }
-
-          $directories = @(
-            $directories |
-              Select-Object -Unique
-          )
-
-          $directories |
-            Set-Content out\include_dirs.txt -Encoding utf8
-
-          Write-Host "Include directories: $($directories.Count)"
-
-          foreach ($directory in $directories) {
-            Write-Host $directory
-          }
-
-      - name: Compile main
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          New-Item -ItemType Directory -Force out | Out-Null
+          $archive = Get-ChildItem $env:GITHUB_WORKSPACE -Recurse -File -Filter "src.zip" |
+            Select-Object -First 1
 
-          $pwn = Get-ChildItem work -Recurse -File -Filter main.pwn |
+          if (-not $archive) {
+            throw "src.zip was not found in the repository."
+          }
+
+          $work = Join-Path $env:GITHUB_WORKSPACE "work"
+
+          if (Test-Path $work) {
+            Remove-Item $work -Recurse -Force
+          }
+
+          New-Item -ItemType Directory -Path $work | Out-Null
+
+          Expand-Archive -LiteralPath $archive.FullName -DestinationPath $work -Force
+
+          Write-Host "Archive extracted to: $work"
+
+      - name: Locate Pawn compiler and source
+        id: locate
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $root = Join-Path $env:GITHUB_WORKSPACE "work"
+
+          $compiler = Get-ChildItem $root -Recurse -File -Filter "pawncc.exe" |
+            Select-Object -First 1
+
+          if (-not $compiler) {
+            throw "pawncc.exe was not found inside src.zip."
+          }
+
+          $source = Get-ChildItem $root -Recurse -File -Filter "main.pwn" |
             Sort-Object Length -Descending |
             Select-Object -First 1
 
-          $compiler = Get-ChildItem work -Recurse -File -Filter pawncc.exe |
-            Select-Object -First 1
-
-          if (-not $pwn) {
-            throw "main.pwn not found."
+          if (-not $source) {
+            throw "main.pwn was not found inside src.zip."
           }
 
-          if (-not $compiler) {
-            throw "pawncc.exe not found."
+          "COMPILER=$($compiler.FullName)" >> $env:GITHUB_ENV
+          "SOURCE=$($source.FullName)" >> $env:GITHUB_ENV
+          "SOURCE_DIR=$($source.DirectoryName)" >> $env:GITHUB_ENV
+
+          Write-Host "Compiler: $($compiler.FullName)"
+          Write-Host "Source:   $($source.FullName)"
+          Write-Host "Source size: $($source.Length) bytes"
+
+      - name: Diagnose compiler dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "=== Compiler directory ==="
+
+          Get-ChildItem (Split-Path $env:COMPILER -Parent) -Force |
+            Select-Object Name, Length |
+            Format-Table -AutoSize
+
+          Write-Host "=== DLL files in extracted source ==="
+
+          Get-ChildItem (Join-Path $env:GITHUB_WORKSPACE "work") `
+            -Recurse -File -Filter "*.dll" |
+            Select-Object FullName, Length |
+            Format-Table -AutoSize
+
+          Write-Host "=== Compiler startup test ==="
+
+          Push-Location (Split-Path $env:COMPILER -Parent)
+
+          try {
+            & $env:COMPILER 2>&1 |
+              ForEach-Object { Write-Host "$_" }
+
+            $code = $LASTEXITCODE
+            Write-Host "Compiler exit code: $code"
+
+            if ($code -eq -1073741515) {
+              Write-Host "ERROR: Windows reports a missing DLL or runtime dependency."
+            }
+          }
+          finally {
+            Pop-Location
           }
 
-          $log = Join-Path $env:GITHUB_WORKSPACE "out\compile.log"
+      - name: Prepare compiler runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
 
-          $arguments = @(
-            $pwn.FullName,
-            "-d3"
+          $compilerDir = Split-Path $env:COMPILER -Parent
+
+          # Add compiler and source directories to PATH so adjacent DLLs
+          # can be found when the executable starts.
+          $env:PATH = "$compilerDir;$env:SOURCE_DIR;$env:PATH"
+
+          Write-Host "Checking common Pawn runtime files..."
+
+          $names = @(
+            "pawncc.exe",
+            "pawnc.dll",
+            "libpawnc.dll"
           )
 
-          if (Test-Path out\include_dirs.txt) {
-            foreach ($directory in (Get-Content out\include_dirs.txt)) {
-              if ($directory -and (Test-Path $directory)) {
-                $arguments += "-i$directory"
-              }
+          foreach ($name in $names) {
+            $found = Get-ChildItem (Join-Path $env:GITHUB_WORKSPACE "work") `
+              -Recurse -File -Filter $name |
+              Select-Object -First 1
+
+            if ($found) {
+              Write-Host "$name => $($found.FullName)"
+            }
+            else {
+              Write-Host "$name => not found"
             }
           }
 
-          Write-Host "COMPILING: $($pwn.FullName)"
-          Write-Host "COMPILER: $($compiler.FullName)"
+          "PATH=$env:PATH" >> $env:GITHUB_ENV
 
-          & $compiler.FullName @arguments *> $log
-          $compileExit = $LASTEXITCODE
+      - name: Compile Pawn mod
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
 
-          Write-Host "COMPILER EXIT CODE: $compileExit"
-          Get-Content $log -Tail 200
+          $compiler = $env:COMPILER
+          $source = $env:SOURCE
+          $sourceDir = $env:SOURCE_DIR
 
-          if ($compileExit -ne 0) {
-            throw "Pawn compilation failed with exit code $compileExit."
+          Write-Host "COMPILER: $compiler"
+          Write-Host "SOURCE:   $source"
+
+          # Run from the source directory so relative includes work.
+          Push-Location $sourceDir
+
+          try {
+            $arguments = @(
+              (Split-Path $source -Leaf),
+              "-d3"
+            )
+
+            # Add all include directories found in the extracted archive.
+            $includeDirs = Get-ChildItem `
+              (Join-Path $env:GITHUB_WORKSPACE "work") `
+              -Directory -Recurse |
+              Where-Object { $_.Name -ieq "include" } |
+              Select-Object -ExpandProperty FullName -Unique
+
+            foreach ($dir in $includeDirs) {
+              $arguments += "-i$dir"
+            }
+
+            Write-Host "Compiler arguments:"
+            $arguments | ForEach-Object { Write-Host "  $_" }
+
+            & $compiler @arguments
+            $compileExit = $LASTEXITCODE
+
+            Write-Host "COMPILER EXIT CODE: $compileExit"
+
+            if ($compileExit -eq -1073741515) {
+              throw "Pawn Compiler cannot start: Windows error 0xC0000135. A required DLL/runtime is missing. Check the Diagnose compiler dependencies step."
+            }
+
+            if ($compileExit -ne 0) {
+              throw "Pawn compilation failed with exit code $compileExit."
+            }
+          }
+          finally {
+            Pop-Location
           }
 
-          $amxPath = [System.IO.Path]::ChangeExtension(
-            $pwn.FullName,
-            ".amx"
-          )
+          $amx = [System.IO.Path]::ChangeExtension($source, ".amx")
 
-          if (-not (Test-Path $amxPath)) {
-            throw "Compiler did not produce the expected AMX file."
+          if (-not (Test-Path $amx)) {
+            throw "Compilation returned success, but the AMX file was not created: $amx"
           }
 
-          $amx = Get-Item $amxPath
+          $size = (Get-Item $amx).Length
 
-          Write-Host "AMX SIZE: $($amx.Length) bytes"
+          Write-Host "AMX file: $amx"
+          Write-Host "AMX size: $size bytes"
 
-          if ($amx.Length -lt 100000) {
-            throw "AMX is too small. Source diagnostics are required."
+          if ($size -lt 100000) {
+            throw "AMX is suspiciously small ($size bytes). Refusing to publish an incomplete mod."
           }
 
-          Copy-Item $amxPath out\main.amx -Force
+          $output = Join-Path $env:GITHUB_WORKSPACE "out"
 
-          Write-Host "AMX validated and copied."
+          New-Item -ItemType Directory -Path $output -Force | Out-Null
 
-      - name: Upload diagnostics
-        if: always()
+          Copy-Item $amx (Join-Path $output "main.amx") -Force
+
+          Write-Host "Compiled mod copied to: $output\main.amx"
+
+      - name: Upload compiled AMX
+        if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: result-windows
-          path: out/
-          if-no-files-found: warn
+          name: compiled-pawn-mod
+          path: out/main.amx
+          if-no-files-found: error
