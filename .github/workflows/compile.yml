@@ -16,18 +16,16 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install Visual C++ 2010 runtime
+      - name: Install Visual C++ runtime
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-
           choco install vcredist2010 -y --no-progress
-
           if ($LASTEXITCODE -ne 0) {
-            throw "Failed to install Visual C++ 2010 Redistributable."
+            throw "Visual C++ runtime installation failed."
           }
 
-      - name: Extract source archive
+      - name: Extract source
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -37,7 +35,7 @@ jobs:
             Select-Object -First 1
 
           if (-not $archive) {
-            throw "src.zip was not found."
+            throw "src.zip not found."
           }
 
           $work = Join-Path $env:GITHUB_WORKSPACE "work"
@@ -47,34 +45,30 @@ jobs:
           }
 
           New-Item -ItemType Directory -Path $work | Out-Null
-
           Expand-Archive -LiteralPath $archive.FullName `
             -DestinationPath $work -Force
 
-          Write-Host "Source extracted successfully."
-
-      - name: Locate compiler and source
+      - name: Locate files
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-
           $root = Join-Path $env:GITHUB_WORKSPACE "work"
 
           $compiler = Get-ChildItem $root -Recurse -File `
             -Filter "pawncc.exe" |
             Select-Object -First 1
 
-          if (-not $compiler) {
-            throw "pawncc.exe was not found."
-          }
-
           $source = Get-ChildItem $root -Recurse -File `
             -Filter "main.pwn" |
             Sort-Object Length -Descending |
             Select-Object -First 1
 
+          if (-not $compiler) {
+            throw "pawncc.exe not found."
+          }
+
           if (-not $source) {
-            throw "main.pwn was not found."
+            throw "main.pwn not found."
           }
 
           "COMPILER=$($compiler.FullName)" >> $env:GITHUB_ENV
@@ -85,41 +79,6 @@ jobs:
           Write-Host "Source: $($source.FullName)"
           Write-Host "Source size: $($source.Length) bytes"
 
-      - name: Test Pawn compiler
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $compilerDir = Split-Path $env:COMPILER -Parent
-          $env:PATH = "$compilerDir;$env:SOURCE_DIR;$env:PATH"
-
-          Write-Host "=== Compiler files ==="
-
-          Get-ChildItem $compilerDir -Force |
-            Select-Object Name, Length |
-            Format-Table -AutoSize
-
-          Write-Host "=== Testing compiler startup ==="
-
-          Push-Location $compilerDir
-
-          try {
-            & $env:COMPILER
-            $code = $LASTEXITCODE
-            Write-Host "Compiler exit code: $code"
-
-            if ($code -eq -1073741515) {
-              throw "Compiler still cannot start. Another required DLL may be missing."
-            }
-
-            if ($code -eq -1073741819) {
-              throw "Compiler crashed during startup."
-            }
-          }
-          finally {
-            Pop-Location
-          }
-
       - name: Compile Pawn mod
         shell: pwsh
         run: |
@@ -128,9 +87,12 @@ jobs:
           $compiler = $env:COMPILER
           $source = $env:SOURCE
           $sourceDir = $env:SOURCE_DIR
+          $root = Join-Path $env:GITHUB_WORKSPACE "work"
 
           $env:PATH = "$(Split-Path $compiler -Parent);$sourceDir;$env:PATH"
 
+          # Run the compiler from the source directory so relative
+          # includes and project files resolve correctly.
           Push-Location $sourceDir
 
           try {
@@ -138,8 +100,6 @@ jobs:
               (Split-Path $source -Leaf),
               "-d3"
             )
-
-            $root = Join-Path $env:GITHUB_WORKSPACE "work"
 
             $includeDirs = Get-ChildItem $root -Directory -Recurse |
               Where-Object { $_.Name -ieq "include" } |
@@ -149,12 +109,15 @@ jobs:
               $arguments += "-i$dir"
             }
 
-            Write-Host "Starting compilation..."
-            & $compiler @arguments
+            Write-Host "Running Pawn compiler..."
+            Write-Host "Compiler: $compiler"
+            Write-Host "Arguments:"
+            $arguments | ForEach-Object { Write-Host "  $_" }
 
+            & $compiler @arguments
             $code = $LASTEXITCODE
 
-            Write-Host "COMPILER EXIT CODE: $code"
+            Write-Host "Compiler exit code: $code"
 
             if ($code -ne 0) {
               throw "Pawn compilation failed with exit code $code."
@@ -167,23 +130,21 @@ jobs:
           $amx = [System.IO.Path]::ChangeExtension($source, ".amx")
 
           if (-not (Test-Path $amx)) {
-            throw "Compiler did not create main.amx."
+            throw "Compilation reported success, but main.amx was not created."
           }
 
           $size = (Get-Item $amx).Length
-
-          Write-Host "Compiled AMX size: $size bytes"
+          Write-Host "AMX size: $size bytes"
 
           if ($size -lt 100000) {
-            throw "AMX is suspiciously small. Refusing to publish."
+            throw "AMX is suspiciously small ($size bytes). The full mod may not have compiled."
           }
 
           $output = Join-Path $env:GITHUB_WORKSPACE "out"
-
-          New-Item -ItemType Directory -Path $output -Force |
-            Out-Null
-
+          New-Item -ItemType Directory -Path $output -Force | Out-Null
           Copy-Item $amx (Join-Path $output "main.amx") -Force
+
+          Write-Host "Compilation completed successfully."
 
       - name: Upload compiled mod
         if: success()
