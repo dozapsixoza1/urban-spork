@@ -1,155 +1,75 @@
-name: Compile Pawn Mod
-
+name: Compile Pawn
 on:
-  push:
   workflow_dispatch:
-  pull_request:
-
-permissions:
-  contents: read
-
+  push:
 jobs:
-  compile:
+  windows:
     runs-on: windows-latest
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Install Visual C++ runtime
+      - uses: actions/checkout@v4
+      - name: Install runtimes
+        shell: pwsh
+        continue-on-error: true
+        run: choco install vcredist2005 vcredist2008 vcredist2010 vcredist140 -y --no-progress
+      - name: Unzip
+        shell: pwsh
+        run: Expand-Archive -Path src.zip -DestinationPath work -Force
+      - name: Use fixed main.pwn from repo root
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
-          choco install vcredist2010 -y --no-progress
-          if ($LASTEXITCODE -ne 0) {
-            throw "Visual C++ runtime installation failed."
-          }
-
-      - name: Extract source
+          if (Test-Path main.pwn) {
+            $t = Get-ChildItem work -Recurse -Filter main.pwn | Sort-Object Length -Descending | Select-Object -First 1
+            Copy-Item main.pwn $t.FullName -Force
+            Write-Host "overlaid main.pwn onto $($t.FullName)"
+          } else { Write-Host "no main.pwn in repo root, using the one from src.zip" }
+      - name: Check main.pwn encoding
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
-
-          $archive = Get-ChildItem $env:GITHUB_WORKSPACE `
-            -Recurse -File -Filter "src.zip" |
-            Select-Object -First 1
-
-          if (-not $archive) {
-            throw "src.zip not found."
+          $t = Get-ChildItem work -Recurse -Filter main.pwn | Sort-Object Length -Descending | Select-Object -First 1
+          $bytes = [System.IO.File]::ReadAllBytes($t.FullName)
+          Write-Host "main.pwn: $($t.FullName) size $($bytes.Length)"
+          $i = [Array]::IndexOf($bytes, [byte]26)
+          if ($i -ge 0) {
+            $line = 1 + ($bytes[0..$i] | Where-Object { $_ -eq 10 }).Count
+            Write-Host "FAIL: byte 0x1A (DOS end-of-file) found at offset $i, line $line. The file was re-saved in a wrong encoding."
+            exit 1
           }
-
-          $work = Join-Path $env:GITHUB_WORKSPACE "work"
-
-          if (Test-Path $work) {
-            Remove-Item $work -Recurse -Force
-          }
-
-          New-Item -ItemType Directory -Path $work | Out-Null
-          Expand-Archive -LiteralPath $archive.FullName `
-            -DestinationPath $work -Force
-
-      - name: Locate files
+          Write-Host "encoding OK: no 0x1A bytes"
+      - name: RakNet include fix
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
-          $root = Join-Path $env:GITHUB_WORKSPACE "work"
-
-          $compiler = Get-ChildItem $root -Recurse -File `
-            -Filter "pawncc.exe" |
-            Select-Object -First 1
-
-          $source = Get-ChildItem $root -Recurse -File `
-            -Filter "main.pwn" |
-            Sort-Object Length -Descending |
-            Select-Object -First 1
-
-          if (-not $compiler) {
-            throw "pawncc.exe not found."
+          $has = Get-ChildItem work -Recurse -Filter Pawn_RakNet.inc
+          $incdir = Get-ChildItem work -Recurse -Directory -Filter include | Select-Object -First 1
+          if ($has) { Write-Host "Pawn_RakNet.inc already present" }
+          else {
+            $dot = Get-ChildItem work -Recurse -Filter Pawn.RakNet.inc | Select-Object -First 1
+            if ($dot) {
+              Copy-Item $dot.FullName (Join-Path $incdir.FullName "Pawn_RakNet.inc")
+              Write-Host "copied Pawn.RakNet.inc as Pawn_RakNet.inc"
+            } else { Write-Host "RAKNET INC NOT FOUND" }
           }
-
-          if (-not $source) {
-            throw "main.pwn not found."
-          }
-
-          "COMPILER=$($compiler.FullName)" >> $env:GITHUB_ENV
-          "SOURCE=$($source.FullName)" >> $env:GITHUB_ENV
-          "SOURCE_DIR=$($source.DirectoryName)" >> $env:GITHUB_ENV
-
-          Write-Host "Compiler: $($compiler.FullName)"
-          Write-Host "Source: $($source.FullName)"
-          Write-Host "Source size: $($source.Length) bytes"
-
-      - name: Compile Pawn mod
+      - name: Compile
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
-
-          $compiler = $env:COMPILER
-          $source = $env:SOURCE
-          $sourceDir = $env:SOURCE_DIR
-          $root = Join-Path $env:GITHUB_WORKSPACE "work"
-
-          $env:PATH = "$(Split-Path $compiler -Parent);$sourceDir;$env:PATH"
-
-          # Run the compiler from the source directory so relative
-          # includes and project files resolve correctly.
-          Push-Location $sourceDir
-
-          try {
-            $arguments = @(
-              (Split-Path $source -Leaf),
-              "-d3"
-            )
-
-            $includeDirs = Get-ChildItem $root -Directory -Recurse |
-              Where-Object { $_.Name -ieq "include" } |
-              Select-Object -ExpandProperty FullName -Unique
-
-            foreach ($dir in $includeDirs) {
-              $arguments += "-i$dir"
-            }
-
-            Write-Host "Running Pawn compiler..."
-            Write-Host "Compiler: $compiler"
-            Write-Host "Arguments:"
-            $arguments | ForEach-Object { Write-Host "  $_" }
-
-            & $compiler @arguments
-            $code = $LASTEXITCODE
-
-            Write-Host "Compiler exit code: $code"
-
-            if ($code -ne 0) {
-              throw "Pawn compilation failed with exit code $code."
-            }
-          }
-          finally {
-            Pop-Location
-          }
-
-          $amx = [System.IO.Path]::ChangeExtension($source, ".amx")
-
-          if (-not (Test-Path $amx)) {
-            throw "Compilation reported success, but main.amx was not created."
-          }
-
-          $size = (Get-Item $amx).Length
-          Write-Host "AMX size: $size bytes"
-
-          if ($size -lt 100000) {
-            throw "AMX is suspiciously small ($size bytes). The full mod may not have compiled."
-          }
-
-          $output = Join-Path $env:GITHUB_WORKSPACE "out"
-          New-Item -ItemType Directory -Path $output -Force | Out-Null
-          Copy-Item $amx (Join-Path $output "main.amx") -Force
-
-          Write-Host "Compilation completed successfully."
-
-      - name: Upload compiled mod
-        if: success()
+          New-Item out -ItemType Directory -Force | Out-Null
+          $pwn = Get-ChildItem work -Recurse -Filter main.pwn | Sort-Object Length -Descending | Select-Object -First 1
+          $cc = Get-ChildItem work -Recurse -Filter pawncc.exe | Select-Object -First 1
+          $opts = @("main.pwn", "-d3")
+          Get-ChildItem work -Recurse -Directory -Filter include | ForEach-Object { $opts += ("-i" + $_.FullName) }
+          Push-Location $pwn.DirectoryName
+          & $cc.FullName @opts *> "$env:GITHUB_WORKSPACE\out\compile.log"
+          Write-Host "exit code: $LASTEXITCODE"
+          Get-Content "$env:GITHUB_WORKSPACE\out\compile.log" -Tail 60
+          $amx = Join-Path $pwn.DirectoryName "main.amx"
+          $size = 0
+          if (Test-Path $amx) { $size = (Get-Item $amx).Length; Copy-Item $amx "$env:GITHUB_WORKSPACE\out\main.amx" }
+          Pop-Location
+          Write-Host "AMX size: $size"
+          if ($size -lt 1000000) { Write-Host "BUILD FAILED: AMX is smaller than 1 MB"; exit 1 }
+          Write-Host "BUILD OK"
+      - name: Upload
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: compiled-pawn-mod
-          path: out/main.amx
-          if-no-files-found: error
+          name: result
+          path: out
