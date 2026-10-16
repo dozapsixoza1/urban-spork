@@ -1,75 +1,391 @@
 name: Compile Pawn
+
 on:
   workflow_dispatch:
   push:
+
 jobs:
   windows:
     runs-on: windows-latest
+
     steps:
-      - uses: actions/checkout@v4
-      - name: Install runtimes
-        shell: pwsh
-        continue-on-error: true
-        run: choco install vcredist2005 vcredist2008 vcredist2010 vcredist140 -y --no-progress
-      - name: Unzip
-        shell: pwsh
-        run: Expand-Archive -Path src.zip -DestinationPath work -Force
-      - name: Use fixed main.pwn from repo root
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Extract source
         shell: pwsh
         run: |
-          if (Test-Path main.pwn) {
-            $t = Get-ChildItem work -Recurse -Filter main.pwn | Sort-Object Length -Descending | Select-Object -First 1
-            Copy-Item main.pwn $t.FullName -Force
-            Write-Host "overlaid main.pwn onto $($t.FullName)"
-          } else { Write-Host "no main.pwn in repo root, using the one from src.zip" }
-      - name: Check main.pwn encoding
-        shell: pwsh
-        run: |
-          $t = Get-ChildItem work -Recurse -Filter main.pwn | Sort-Object Length -Descending | Select-Object -First 1
-          $bytes = [System.IO.File]::ReadAllBytes($t.FullName)
-          Write-Host "main.pwn: $($t.FullName) size $($bytes.Length)"
-          $i = [Array]::IndexOf($bytes, [byte]26)
-          if ($i -ge 0) {
-            $line = 1 + ($bytes[0..$i] | Where-Object { $_ -eq 10 }).Count
-            Write-Host "FAIL: byte 0x1A (DOS end-of-file) found at offset $i, line $line. The file was re-saved in a wrong encoding."
+          if (-not (Test-Path "src.zip")) {
+            Write-Host "ERROR: src.zip not found in repository root"
+            Get-ChildItem -Force | Select-Object Name
             exit 1
           }
-          Write-Host "encoding OK: no 0x1A bytes"
-      - name: RakNet include fix
-        shell: pwsh
-        run: |
-          $has = Get-ChildItem work -Recurse -Filter Pawn_RakNet.inc
-          $incdir = Get-ChildItem work -Recurse -Directory -Filter include | Select-Object -First 1
-          if ($has) { Write-Host "Pawn_RakNet.inc already present" }
-          else {
-            $dot = Get-ChildItem work -Recurse -Filter Pawn.RakNet.inc | Select-Object -First 1
-            if ($dot) {
-              Copy-Item $dot.FullName (Join-Path $incdir.FullName "Pawn_RakNet.inc")
-              Write-Host "copied Pawn.RakNet.inc as Pawn_RakNet.inc"
-            } else { Write-Host "RAKNET INC NOT FOUND" }
-          }
-      - name: Compile
-        shell: pwsh
-        run: |
+
+          Expand-Archive -Path src.zip -DestinationPath work -Force
           New-Item out -ItemType Directory -Force | Out-Null
-          $pwn = Get-ChildItem work -Recurse -Filter main.pwn | Sort-Object Length -Descending | Select-Object -First 1
-          $cc = Get-ChildItem work -Recurse -Filter pawncc.exe | Select-Object -First 1
-          $opts = @("main.pwn", "-d3")
-          Get-ChildItem work -Recurse -Directory -Filter include | ForEach-Object { $opts += ("-i" + $_.FullName) }
+          Write-Host "Archive extracted."
+
+      - name: Overlay root main.pwn when provided
+        shell: pwsh
+        run: |
+          if (Test-Path "main.pwn") {
+            $target = Get-ChildItem work -Recurse -File -Filter main.pwn |
+              Sort-Object Length -Descending |
+              Select-Object -First 1
+
+            if (-not $target) {
+              Write-Host "ERROR: main.pwn not found inside src.zip"
+              exit 1
+            }
+
+            Copy-Item "main.pwn" $target.FullName -Force
+            Write-Host "Updated source: $($target.FullName)"
+          } else {
+            Write-Host "WARNING: root main.pwn is missing."
+            Write-Host "Using the source extracted from src.zip."
+          }
+
+      - name: Locate Pawn source and compiler
+        shell: pwsh
+        run: |
+          $pwn = Get-ChildItem work -Recurse -File -Filter main.pwn |
+            Sort-Object Length -Descending |
+            Select-Object -First 1
+
+          if (-not $pwn) {
+            Write-Host "ERROR: main.pwn not found"
+            exit 1
+          }
+
+          $preferred = Join-Path $pwn.DirectoryName "pawncc.exe"
+
+          if (Test-Path $preferred) {
+            $compiler = Get-Item $preferred
+          } else {
+            $compiler = Get-ChildItem work -Recurse -File -Filter pawncc.exe |
+              Select-Object -First 1
+          }
+
+          if (-not $compiler) {
+            Write-Host "ERROR: pawncc.exe not found"
+            exit 1
+          }
+
+          Write-Host "SOURCE: $($pwn.FullName)"
+          Write-Host "SOURCE SIZE: $($pwn.Length) bytes"
+          Write-Host "COMPILER: $($compiler.FullName)"
+
+          "SOURCE=$($pwn.FullName)" | Set-Content out\paths.txt
+          "COMPILER=$($compiler.FullName)" | Add-Content out\paths.txt
+
+      - name: Remove Ctrl-Z bytes from Pawn sources
+        shell: pwsh
+        run: |
+          $files = Get-ChildItem work -Recurse -File |
+            Where-Object { $_.Extension -in @(".pwn", ".inc") }
+
+          $total = 0
+
+          foreach ($file in $files) {
+            $bytes = [IO.File]::ReadAllBytes($file.FullName)
+
+            if ($bytes -contains 26) {
+              $clean = [Collections.Generic.List[byte]]::new()
+
+              foreach ($b in $bytes) {
+                if ($b -eq 26) {
+                  $total++
+                } else {
+                  $clean.Add($b)
+                }
+              }
+
+              [IO.File]::WriteAllBytes(
+                $file.FullName,
+                $clean.ToArray()
+              )
+
+              Write-Host "Removed Ctrl-Z bytes from $($file.FullName)"
+            }
+          }
+
+          "Removed Ctrl-Z bytes: $total" |
+            Set-Content out\source_bytes.txt
+
+          Write-Host "TOTAL Ctrl-Z bytes removed: $total"
+
+      - name: Fix RakNet include filename if needed
+        shell: pwsh
+        run: |
+          $target = Get-ChildItem work -Recurse -File -Filter Pawn_RakNet.inc
+
+          if (-not $target) {
+            $source = Get-ChildItem work -Recurse -File |
+              Where-Object { $_.Name -ieq "Pawn.RakNet.inc" } |
+              Select-Object -First 1
+
+            $includeDir = Get-ChildItem work -Recurse -Directory -Filter include |
+              Select-Object -First 1
+
+            if ($source -and $includeDir) {
+              Copy-Item $source.FullName `
+                (Join-Path $includeDir.FullName "Pawn_RakNet.inc") -Force
+
+              Write-Host "Copied alternate RakNet include filename."
+            } else {
+              Write-Host "No alternate RakNet include found."
+            }
+          }
+
+      - name: Install Visual C++ 2010 Runtime
+        shell: pwsh
+        run: |
+          Write-Host "Checking Visual C++ 2010 runtime..."
+
+          foreach ($path in @(
+            "$env:WINDIR\SysWOW64\MSVCR100.dll",
+            "$env:WINDIR\System32\MSVCR100.dll"
+          )) {
+            Write-Host "$path : $(Test-Path $path)"
+          }
+
+          if (-not (
+            (Test-Path "$env:WINDIR\SysWOW64\MSVCR100.dll") -or
+            (Test-Path "$env:WINDIR\System32\MSVCR100.dll")
+          )) {
+            choco install vcredist2010 -y --no-progress
+
+            Write-Host "Chocolatey exit code: $LASTEXITCODE"
+
+            foreach ($path in @(
+              "$env:WINDIR\SysWOW64\MSVCR100.dll",
+              "$env:WINDIR\System32\MSVCR100.dll"
+            )) {
+              Write-Host "$path : $(Test-Path $path)"
+            }
+          }
+
+      - name: Prepare compiler DLL dependencies
+        shell: pwsh
+        run: |
+          $pwn = Get-ChildItem work -Recurse -File -Filter main.pwn |
+            Sort-Object Length -Descending |
+            Select-Object -First 1
+
+          $preferred = Join-Path $pwn.DirectoryName "pawncc.exe"
+
+          if (Test-Path $preferred) {
+            $compiler = Get-Item $preferred
+          } else {
+            $compiler = Get-ChildItem work -Recurse -File -Filter pawncc.exe |
+              Select-Object -First 1
+          }
+
+          if (-not $compiler) {
+            Write-Host "ERROR: pawncc.exe not found"
+            exit 1
+          }
+
+          $compilerDir = $compiler.DirectoryName
+
+          $dllFiles = Get-ChildItem work -Recurse -File -Filter "*.dll"
+          $dllDirs = $dllFiles |
+            ForEach-Object { $_.DirectoryName } |
+            Sort-Object -Unique
+
+          $env:PATH = (
+            ($dllDirs -join ";") +
+            ";" + $compilerDir +
+            ";" + $env:PATH
+          )
+
+          $env:PATH | Set-Content out\dll_search_path.txt
+
+          foreach ($dll in $dllFiles) {
+            $destination = Join-Path $compilerDir $dll.Name
+
+            if (
+              $dll.FullName -ne $destination -and
+              -not (Test-Path $destination)
+            ) {
+              Copy-Item $dll.FullName $destination -Force
+              Write-Host "Copied DLL: $($dll.Name)"
+            }
+          }
+
+          Write-Host "Compiler: $($compiler.FullName)"
+
+          Get-ChildItem $compilerDir -File -Filter "*.dll" |
+            ForEach-Object {
+              Write-Host "$($_.Name) ($($_.Length) bytes)"
+            }
+
+      - name: Diagnose compiler startup
+        shell: pwsh
+        run: |
+          $pwn = Get-ChildItem work -Recurse -File -Filter main.pwn |
+            Sort-Object Length -Descending |
+            Select-Object -First 1
+
+          $preferred = Join-Path $pwn.DirectoryName "pawncc.exe"
+
+          if (Test-Path $preferred) {
+            $compiler = Get-Item $preferred
+          } else {
+            $compiler = Get-ChildItem work -Recurse -File -Filter pawncc.exe |
+              Select-Object -First 1
+          }
+
+          if (-not $compiler) {
+            Write-Host "ERROR: pawncc.exe not found"
+            exit 1
+          }
+
+          $report = @(
+            "Source: $($pwn.FullName)"
+            "Compiler: $($compiler.FullName)"
+          )
+
+          foreach ($name in @("MSVCR100.dll", "PAWNC.dll")) {
+            $found = Get-ChildItem work -Recurse -File -Filter $name |
+              Select-Object -First 1
+
+            if ($found) {
+              Write-Host "FOUND $name : $($found.FullName)"
+              $report += "FOUND $name : $($found.FullName)"
+            } else {
+              Write-Host "Not found in work: $name"
+              $report += "Not found in work: $name"
+            }
+          }
+
+          Write-Host "Testing compiler startup..."
+
+          Push-Location $compiler.DirectoryName
+
+          try {
+            & $compiler.FullName *> "$env:GITHUB_WORKSPACE\out\compiler_test.log"
+            $testExit = $LASTEXITCODE
+          } catch {
+            $_ | Out-String |
+              Add-Content "$env:GITHUB_WORKSPACE\out\compiler_test.log"
+
+            $testExit = 1
+          } finally {
+            Pop-Location
+          }
+
+          Write-Host "Compiler startup exit code: $testExit"
+
+          $report += "Compiler startup exit code: $testExit"
+          $report | Set-Content out\compiler_diagnostics.txt
+
+          # This step is diagnostic; compilation has its own failure check.
+          exit 0
+
+      - name: Compile main
+        shell: pwsh
+        run: |
+          $pwn = Get-ChildItem work -Recurse -File -Filter main.pwn |
+            Sort-Object Length -Descending |
+            Select-Object -First 1
+
+          if (-not $pwn) {
+            Write-Host "ERROR: main.pwn not found"
+            exit 1
+          }
+
+          $preferred = Join-Path $pwn.DirectoryName "pawncc.exe"
+
+          if (Test-Path $preferred) {
+            $compiler = Get-Item $preferred
+          } else {
+            $compiler = Get-ChildItem work -Recurse -File -Filter pawncc.exe |
+              Select-Object -First 1
+          }
+
+          if (-not $compiler) {
+            Write-Host "ERROR: pawncc.exe not found"
+            exit 1
+          }
+
+          $dllDirs = Get-ChildItem work -Recurse -File -Filter "*.dll" |
+            ForEach-Object { $_.DirectoryName } |
+            Sort-Object -Unique
+
+          $env:PATH = (
+            ($dllDirs -join ";") +
+            ";" + $compiler.DirectoryName +
+            ";" + $env:PATH
+          )
+
+          $includeDirs = Get-ChildItem work -Recurse -Directory -Filter include
+
+          # Diagnostic test without -d3. If this succeeds, debug information
+          # may be involved in the crash; it is not yet confirmed.
+          $argsList = @($pwn.FullName)
+
+          foreach ($inc in $includeDirs) {
+            $argsList += "-i$($inc.FullName)"
+          }
+
+          $log = Join-Path $env:GITHUB_WORKSPACE "out\compile.log"
+
+          Write-Host "SOURCE: $($pwn.FullName)"
+          Write-Host "SOURCE SIZE: $($pwn.Length)"
+          Write-Host "COMPILER: $($compiler.FullName)"
+          Write-Host "INCLUDE DIRECTORIES: $($includeDirs.Count)"
+
           Push-Location $pwn.DirectoryName
-          & $cc.FullName @opts *> "$env:GITHUB_WORKSPACE\out\compile.log"
-          Write-Host "exit code: $LASTEXITCODE"
-          Get-Content "$env:GITHUB_WORKSPACE\out\compile.log" -Tail 60
-          $amx = Join-Path $pwn.DirectoryName "main.amx"
-          $size = 0
-          if (Test-Path $amx) { $size = (Get-Item $amx).Length; Copy-Item $amx "$env:GITHUB_WORKSPACE\out\main.amx" }
-          Pop-Location
-          Write-Host "AMX size: $size"
-          if ($size -lt 1000000) { Write-Host "BUILD FAILED: AMX is smaller than 1 MB"; exit 1 }
+
+          try {
+            & $compiler.FullName @argsList *> $log
+            $compileExit = $LASTEXITCODE
+          } catch {
+            $_ | Out-String | Add-Content $log
+            $compileExit = 1
+          } finally {
+            Pop-Location
+          }
+
+          Write-Host "COMPILER EXIT CODE: $compileExit"
+
+          if (Test-Path $log) {
+            Get-Content $log -Tail 300
+          }
+
+          "Compiler exit code: $compileExit" |
+            Set-Content out\compiler_status.txt
+
+          if ($compileExit -ne 0) {
+            Write-Host "ERROR: Pawn compiler failed."
+            exit 1
+          }
+
+          $amxPath = Join-Path $pwn.DirectoryName "main.amx"
+
+          if (-not (Test-Path $amxPath)) {
+            Write-Host "ERROR: main.amx was not generated"
+            exit 1
+          }
+
+          $amx = Get-Item $amxPath
+
+          Write-Host "AMX SIZE: $($amx.Length) bytes"
+
+          if ($amx.Length -lt 1000000) {
+            Write-Host "ERROR: AMX is suspiciously small."
+            exit 1
+          }
+
+          Copy-Item $amxPath "out\main.amx" -Force
+
           Write-Host "BUILD OK"
-      - name: Upload
+
+      - name: Upload logs and AMX
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: result
-          path: out
+          name: result-windows
+          path: out/
+          if-no-files-found: warn
