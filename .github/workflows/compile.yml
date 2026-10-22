@@ -45,19 +45,27 @@ jobs:
             Write-Host "Using the source extracted from src.zip."
           }
 
-      - name: Download Official Clean Pawn Compiler
+      - name: Download Official Clean Pawn Compiler via GitHub API
         shell: pwsh
         run: |
           $compilerDest = Join-Path $env:GITHUB_WORKSPACE "compiler_bin"
           New-Item -ItemType Directory -Force -Path $compilerDest | Out-Null
 
-          Write-Host "Downloading official open.mp pawn compiler..."
-          $url = "https://github.com/openmultiplayer/compiler/releases/latest/download/pawnc-windows.zip"
+          Write-Host "Fetching latest pawn compiler release info from open.mp..."
+          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/openmultiplayer/compiler/releases/latest" -Headers @{ "User-Agent" = "PowerShell" }
+          $asset = $release.assets | Where-Object { $_.name -like "*windows*" } | Select-Object -First 1
+
+          if (-not $asset) {
+            Write-Host "ERROR: Could not find Windows compiler asset in latest release."
+            exit 1
+          }
+
+          Write-Host "Downloading from: $($asset.browser_download_url)"
           $zipPath = Join-Path $env:TEMP "pawnc_official.zip"
           $extractedTemp = Join-Path $env:TEMP "pawnc_extracted_temp"
           if (Test-Path $extractedTemp) { Remove-Item $extractedTemp -Recurse -Force }
 
-          Invoke-WebRequest -Uri $url -OutFile $zipPath
+          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zipPath
           Expand-Archive -Path $zipPath -DestinationPath $extractedTemp -Force
 
           $foundCompiler = Get-ChildItem $extractedTemp -Recurse -File -Filter pawncc.exe | Select-Object -First 1
@@ -74,11 +82,9 @@ jobs:
             $fileInfo = Get-Item $finalCompilerExe
             Write-Host "Compiler file size: $($fileInfo.Length) bytes"
 
-            # Проверка, что это валидный PE-файл (начинается с MZ)
             $bytes = [System.IO.File]::ReadAllBytes($finalCompilerExe)
             if ($bytes.Length -lt 2 -or $bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) {
-              Write-Host "ERROR: Downloaded pawncc.exe is NOT a valid Windows executable! Content preview:"
-              [System.Text.Encoding]::UTF8.GetString($bytes, 0, [Math]::Min($bytes.Length, 300))
+              Write-Host "ERROR: Downloaded pawncc.exe is NOT a valid Windows executable!"
               exit 1
             }
             Write-Host "Compiler PE header verified successfully (MZ header found)."
@@ -99,6 +105,7 @@ jobs:
             exit 1
           }
 
+          # Жестко используем чистый скачанный компилятор, игнорируя мусор из архива
           $compiler = Get-Item (Join-Path $env:GITHUB_WORKSPACE "compiler_bin\pawncc.exe")
 
           Write-Host "SOURCE: $($pwn.FullName)"
@@ -263,6 +270,7 @@ jobs:
             exit 1
           }
 
+          # Жестко используем чистый скачанный компилятор
           $compiler = Get-Item (Join-Path $env:GITHUB_WORKSPACE "compiler_bin\pawncc.exe")
 
           $includeDirs = Get-ChildItem work -Recurse -Directory -Filter include
