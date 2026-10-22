@@ -45,6 +45,23 @@ jobs:
             Write-Host "Using the source extracted from src.zip."
           }
 
+      - name: Download Reliable Pawn Compiler
+        shell: pwsh
+        run: |
+          $pwn = Get-ChildItem work -Recurse -File -Filter main.pwn | Sort-Object Length -Descending | Select-Object -First 1
+          $compilerDir = $pwn.DirectoryName
+          
+          Write-Host "Downloading stable pawncc..."
+          $url = "https://github.com/openmultiplayer/compiler/releases/download/v3.10.10.6/pawnc-3.10.10.6-windows.zip"
+          $zipPath = Join-Path $env:TEMP "pawnc.zip"
+          Invoke-WebRequest -Uri $url -OutFile $zipPath
+          
+          Expand-Archive -Path $zipPath -DestinationPath (Join-Path $env:TEMP "pawnc_extracted") -Force
+          
+          # Копируем свежий рабочий компилятор в папку с исходниками мода
+          Copy-Item (Join-Path $env:TEMP "pawnc_extracted\bin\*") $compilerDir -Recurse -Force
+          Write-Host "Pawn compiler replaced with stable version."
+
       - name: Locate Pawn source and compiler
         shell: pwsh
         run: |
@@ -77,33 +94,6 @@ jobs:
 
           "SOURCE=$($pwn.FullName)" | Set-Content out\paths.txt
           "COMPILER=$($compiler.FullName)" | Add-Content out\paths.txt
-
-      - name: Patch Compiler for Large Address Aware (LAA)
-        shell: pwsh
-        run: |
-          $pwn = Get-ChildItem work -Recurse -File -Filter main.pwn |
-            Sort-Object Length -Descending |
-            Select-Object -First 1
-
-          $preferred = Join-Path $pwn.DirectoryName "pawncc.exe"
-          $compiler = if (Test-Path $preferred) { Get-Item $preferred } else { Get-ChildItem work -Recurse -File -Filter pawncc.exe | Select-Object -First 1 }
-
-          if ($compiler) {
-            $path = $compiler.FullName
-            $bytes = [System.IO.File]::ReadAllBytes($path)
-            $peOffset = [System.BitConverter]::ToInt32($bytes, 0x3C)
-            $charOffset = $peOffset + 22
-            $chars = [System.BitConverter]::ToUInt16($bytes, $charOffset)
-
-            if (($chars -band 0x0020) -eq 0) {
-              $chars = $chars -bor 0x0020
-              [System.BitConverter]::GetBytes($chars).CopyTo($bytes, $charOffset)
-              [System.IO.File]::WriteAllBytes($path, $bytes)
-              Write-Host "Successfully patched pawncc.exe with Large Address Aware (LAA) flag!"
-            } else {
-              Write-Host "pawncc.exe already has LAA flag set."
-            }
-          }
 
       - name: Remove Ctrl-Z bytes from Pawn sources
         shell: pwsh
@@ -164,143 +154,6 @@ jobs:
             }
           }
 
-      - name: Install Visual C++ 2010 Runtime
-        shell: pwsh
-        run: |
-          Write-Host "Checking Visual C++ 2010 runtime..."
-
-          foreach ($path in @(
-            "$env:WINDIR\SysWOW64\MSVCR100.dll",
-            "$env:WINDIR\System32\MSVCR100.dll"
-          )) {
-            Write-Host "$path : $(Test-Path $path)"
-          }
-
-          if (-not (
-            (Test-Path "$env:WINDIR\SysWOW64\MSVCR100.dll") -or
-            (Test-Path "$env:WINDIR\System32\MSVCR100.dll")
-          )) {
-            choco install vcredist2010 -y --no-progress
-
-            Write-Host "Chocolatey exit code: $LASTEXITCODE"
-
-            foreach ($path in @(
-              "$env:WINDIR\SysWOW64\MSVCR100.dll",
-              "$env:WINDIR\System32\MSVCR100.dll"
-            )) {
-              Write-Host "$path : $(Test-Path $path)"
-            }
-          }
-
-      - name: Prepare compiler DLL dependencies
-        shell: pwsh
-        run: |
-          $pwn = Get-ChildItem work -Recurse -File -Filter main.pwn |
-            Sort-Object Length -Descending |
-            Select-Object -First 1
-
-          $preferred = Join-Path $pwn.DirectoryName "pawncc.exe"
-
-          if (Test-Path $preferred) {
-            $compiler = Get-Item $preferred
-          } else {
-            $compiler = Get-ChildItem work -Recurse -File -Filter pawncc.exe |
-              Select-Object -First 1
-          }
-
-          if (-not $compiler) {
-            Write-Host "ERROR: pawncc.exe not found"
-            exit 1
-          }
-
-          $compilerDir = $compiler.DirectoryName
-
-          $compilerDlls = Get-ChildItem work -Recurse -File | Where-Object { $_.Name -ieq "pawnc.dll" -or $_.Name -ieq "pawnv.dll" }
-
-          foreach ($dll in $compilerDlls) {
-            $destination = Join-Path $compilerDir $dll.Name
-
-            if ($dll.FullName -ne $destination -and -not (Test-Path $destination)) {
-              Copy-Item $dll.FullName $destination -Force
-              Write-Host "Copied compiler DLL: $($dll.Name)"
-            }
-          }
-
-          Write-Host "Compiler: $($compiler.FullName)"
-
-          Get-ChildItem $compilerDir -File -Filter "*.dll" |
-            ForEach-Object {
-              Write-Host "$($_.Name) ($($_.Length) bytes)"
-            }
-
-      - name: Diagnose compiler startup
-        shell: pwsh
-        run: |
-          $pwn = Get-ChildItem work -Recurse -File -Filter main.pwn |
-            Sort-Object Length -Descending |
-            Select-Object -First 1
-
-          $preferred = Join-Path $pwn.DirectoryName "pawncc.exe"
-
-          if (Test-Path $preferred) {
-            $compiler = Get-Item $preferred
-          } else {
-            $compiler = Get-ChildItem work -Recurse -File -Filter pawncc.exe |
-              Select-Object -First 1
-          }
-
-          if (-not $compiler) {
-            Write-Host "ERROR: pawncc.exe not found"
-            exit 1
-          }
-
-          Write-Host "Testing compiler startup..."
-
-          Push-Location $compiler.DirectoryName
-
-          try {
-            $processInfo = New-Object System.Diagnostics.ProcessStartInfo
-            $processInfo.FileName = $compiler.FullName
-            $processInfo.RedirectStandardOutput = $true
-            $processInfo.RedirectStandardError = $true
-            $processInfo.UseShellExecute = $false
-            $processInfo.CreateNoWindow = $true
-
-            $process = New-Object System.Diagnostics.Process
-            $process.StartInfo = $processInfo
-            
-            $outputBuilder = New-Object System.Text.StringBuilder
-            $stdOutEvent = Register-ObjectEvent -InputObject $process -EventName OutputDataReceived -Action {
-                if ($EventArgs.Data) { $Event.MessageData.AppendLine($EventArgs.Data) }
-            } -MessageData $outputBuilder
-
-            $stdErrEvent = Register-ObjectEvent -InputObject $process -EventName ErrorDataReceived -Action {
-                if ($EventArgs.Data) { $Event.MessageData.AppendLine($EventArgs.Data) }
-            } -MessageData $outputBuilder
-
-            [void]$process.Start()
-            $process.BeginOutputReadLine()
-            $process.BeginErrorReadLine()
-            $process.WaitForExit()
-
-            $testExit = $process.ExitCode
-
-            Unregister-Event -SourceIdentifier $stdOutEvent.Name
-            Unregister-Event -SourceIdentifier $stdErrEvent.Name
-
-            $outputBuilder.ToString() | Set-Content "$env:GITHUB_WORKSPACE\out\compiler_test.log" -Encoding UTF8
-          } catch {
-            $_ | Out-String |
-              Add-Content "$env:GITHUB_WORKSPACE\out\compiler_test.log"
-
-            $testExit = 1
-          } finally {
-            Pop-Location
-          }
-
-          Write-Host "Compiler startup exit code: $testExit"
-          exit 0
-
       - name: Compile main
         shell: pwsh
         run: |
@@ -326,16 +179,6 @@ jobs:
             Write-Host "ERROR: pawncc.exe not found"
             exit 1
           }
-
-          $dllDirs = Get-ChildItem work -Recurse -File -Filter "*.dll" |
-            ForEach-Object { $_.DirectoryName } |
-            Sort-Object -Unique
-
-          $env:PATH = (
-            ($dllDirs -join ";") +
-            ";" + $compiler.DirectoryName +
-            ";" + $env:PATH
-          )
 
           $includeDirs = Get-ChildItem work -Recurse -Directory -Filter include
 
