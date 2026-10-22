@@ -45,52 +45,28 @@ jobs:
             Write-Host "Using the source extracted from src.zip."
           }
 
-      - name: Download Official Clean Pawn Compiler via GitHub API
+      - name: Download Stable Pawn Compiler
         shell: pwsh
         run: |
           $compilerDest = Join-Path $env:GITHUB_WORKSPACE "compiler_bin"
           if (Test-Path $compilerDest) { Remove-Item $compilerDest -Recurse -Force }
           New-Item -ItemType Directory -Force -Path $compilerDest | Out-Null
 
-          Write-Host "Fetching latest pawn compiler release info from open.mp..."
-          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/openmultiplayer/compiler/releases/latest" -Headers @{ "User-Agent" = "PowerShell" }
+          Write-Host "Downloading stable Windows pawn compiler..."
+          $url = "https://github.com/pawn-lang/compiler/releases/download/v3.10.10/pawnc-3.10.10-windows.zip"
+          $zipPath = Join-Path $env:TEMP "pawnc.zip"
           
-          # Строго ищем архив скомпилированных под Windows binaries
-          $asset = $release.assets | Where-Object { $_.name -like "pawnc-*-windows.zip" } | Select-Object -First 1
-          if (-not $asset) {
-            $asset = $release.assets | Where-Object { $_.name -like "*windows*.zip" } | Select-Object -First 1
-          }
-
-          if (-not $asset) {
-            Write-Host "ERROR: Could not find Windows compiler asset in latest release."
-            exit 1
-          }
-
-          Write-Host "Downloading from: $($asset.browser_download_url)"
-          $zipPath = Join-Path $env:TEMP "pawnc_official.zip"
-          $extractedTemp = Join-Path $env:TEMP "pawnc_extracted_temp"
-          if (Test-Path $extractedTemp) { Remove-Item $extractedTemp -Recurse -Force }
-
-          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zipPath
-          
+          Invoke-WebRequest -Uri $url -OutFile $zipPath
           $zipSize = (Get-Item $zipPath).Length
           Write-Host "Downloaded zip size: $zipSize bytes"
-          if ($zipSize -lt 10000) {
-            Write-Host "ERROR: Downloaded zip is too small, likely an error page."
-            Get-Content $zipPath
-            exit 1
+
+          Expand-Archive -Path $zipPath -DestinationPath $compilerDest -Force
+
+          # Если файлы распаковались внутрь вложенной папки bin, поднимаем их в compiler_bin
+          $nestedBin = Get-ChildItem $compilerDest -Recurse -Directory -Filter bin | Select-Object -First 1
+          if ($nestedBin) {
+            Copy-Item (Join-Path $nestedBin.FullName "*") $compilerDest -Recurse -Force
           }
-
-          Expand-Archive -Path $zipPath -DestinationPath $extractedTemp -Force
-
-          $foundCompiler = Get-ChildItem $extractedTemp -Recurse -File -Filter pawncc.exe | Select-Object -First 1
-          if (-not $foundCompiler) {
-            Write-Host "ERROR: pawncc.exe not found in downloaded archive."
-            exit 1
-          }
-
-          Write-Host "Found compiler at: $($foundCompiler.FullName)"
-          Copy-Item (Join-Path $foundCompiler.DirectoryName "*") $compilerDest -Recurse -Force
 
           $finalCompilerExe = Join-Path $compilerDest "pawncc.exe"
           if (Test-Path $finalCompilerExe) {
@@ -99,12 +75,12 @@ jobs:
 
             $bytes = [System.IO.File]::ReadAllBytes($finalCompilerExe)
             if ($bytes.Length -lt 2 -or $bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) {
-              Write-Host "ERROR: Downloaded pawncc.exe does not have valid MZ header!"
+              Write-Host "ERROR: pawncc.exe does not have valid MZ header!"
               exit 1
             }
             Write-Host "MZ header verified successfully."
           } else {
-            Write-Host "ERROR: pawncc.exe failed to copy into compiler_bin"
+            Write-Host "ERROR: pawncc.exe not found after extraction."
             exit 1
           }
 
