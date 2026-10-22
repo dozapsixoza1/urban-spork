@@ -45,7 +45,7 @@ jobs:
             Write-Host "Using the source extracted from src.zip."
           }
 
-      - name: Download Stable Pawn Compiler
+      - name: Download and Flatten Stable Pawn Compiler
         shell: pwsh
         run: |
           $compilerDest = Join-Path $env:GITHUB_WORKSPACE "compiler_bin"
@@ -57,32 +57,33 @@ jobs:
           $zipPath = Join-Path $env:TEMP "pawnc.zip"
           
           Invoke-WebRequest -Uri $url -OutFile $zipPath
-          $zipSize = (Get-Item $zipPath).Length
-          Write-Host "Downloaded zip size: $zipSize bytes"
+          $extractedTemp = Join-Path $env:TEMP "pawnc_extracted"
+          if (Test-Path $extractedTemp) { Remove-Item $extractedTemp -Recurse -Force }
 
-          Expand-Archive -Path $zipPath -DestinationPath $compilerDest -Force
+          Expand-Archive -Path $zipPath -DestinationPath $extractedTemp -Force
 
-          # Если файлы распаковались внутрь вложенной папки bin, поднимаем их в compiler_bin
-          $nestedBin = Get-ChildItem $compilerDest -Recurse -Directory -Filter bin | Select-Object -First 1
-          if ($nestedBin) {
-            Copy-Item (Join-Path $nestedBin.FullName "*") $compilerDest -Recurse -Force
+          # Рекурсивно собираем все файлы и копируем их напрямую в compiler_bin (чтобы pawncc.exe и pawnc.dll были рядом)
+          Get-ChildItem $extractedTemp -Recurse -File | ForEach-Object {
+            Copy-Item $_.FullName $compilerDest -Force
           }
+
+          Write-Host "Contents of compiler_bin:"
+          Get-ChildItem $compilerDest | Select-Object Name, Length
 
           $finalCompilerExe = Join-Path $compilerDest "pawncc.exe"
-          if (Test-Path $finalCompilerExe) {
-            $fileInfo = Get-Item $finalCompilerExe
-            Write-Host "Compiler verified: $($fileInfo.FullName) ($($fileInfo.Length) bytes)"
+          $finalCompilerDll = Join-Path $compilerDest "pawnc.dll"
 
-            $bytes = [System.IO.File]::ReadAllBytes($finalCompilerExe)
-            if ($bytes.Length -lt 2 -or $bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) {
-              Write-Host "ERROR: pawncc.exe does not have valid MZ header!"
-              exit 1
-            }
-            Write-Host "MZ header verified successfully."
-          } else {
-            Write-Host "ERROR: pawncc.exe not found after extraction."
+          if (-not (Test-Path $finalCompilerExe) -or -not (Test-Path $finalCompilerDll)) {
+            Write-Host "ERROR: pawncc.exe or pawnc.dll missing in compiler_bin!"
             exit 1
           }
+
+          $bytes = [System.IO.File]::ReadAllBytes($finalCompilerExe)
+          if ($bytes.Length -lt 2 -or $bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) {
+            Write-Host "ERROR: pawncc.exe does not have valid MZ header!"
+            exit 1
+          }
+          Write-Host "MZ header and dependencies verified successfully."
 
       - name: Patch Compiler for Large Address Aware (LAA)
         shell: pwsh
