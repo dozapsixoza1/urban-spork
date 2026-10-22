@@ -259,8 +259,36 @@ jobs:
           Push-Location $compiler.DirectoryName
 
           try {
-            & $compiler.FullName > "$env:GITHUB_WORKSPACE\out\compiler_test.log" 2>&1
-            $testExit = $LASTEXITCODE
+            $processInfo = New-Object System.Diagnostics.ProcessStartInfo
+            $processInfo.FileName = $compiler.FullName
+            $processInfo.RedirectStandardOutput = $true
+            $processInfo.RedirectStandardError = $true
+            $processInfo.UseShellExecute = $false
+            $processInfo.CreateNoWindow = $true
+
+            $process = New-Object System.Diagnostics.Process
+            $process.StartInfo = $processInfo
+            
+            $outputBuilder = New-Object System.Text.StringBuilder
+            $stdOutEvent = Register-ObjectEvent -InputObject $process -EventName OutputDataReceived -Action {
+                if ($EventArgs.Data) { $Event.MessageData.AppendLine($EventArgs.Data) }
+            } -MessageData $outputBuilder
+
+            $stdErrEvent = Register-ObjectEvent -InputObject $process -EventName ErrorDataReceived -Action {
+                if ($EventArgs.Data) { $Event.MessageData.AppendLine($EventArgs.Data) }
+            } -MessageData $outputBuilder
+
+            [void]$process.Start()
+            $process.BeginOutputReadLine()
+            $process.BeginErrorReadLine()
+            $process.WaitForExit()
+
+            $testExit = $process.ExitCode
+
+            Unregister-Event -SourceIdentifier $stdOutEvent.Name
+            Unregister-Event -SourceIdentifier $stdErrEvent.Name
+
+            $outputBuilder.ToString() | Set-Content "$env:GITHUB_WORKSPACE\out\compiler_test.log" -Encoding UTF8
           } catch {
             $_ | Out-String |
               Add-Content "$env:GITHUB_WORKSPACE\out\compiler_test.log"
@@ -327,8 +355,37 @@ jobs:
           Push-Location $pwn.DirectoryName
 
           try {
-            & $compiler.FullName @argsList > $log 2>&1
-            $compileExit = $LASTEXITCODE
+            $processInfo = New-Object System.Diagnostics.ProcessStartInfo
+            $processInfo.FileName = $compiler.FullName
+            $processInfo.Arguments = [string]::Join(" ", ($argsList | ForEach-Object { "`"$_`"" }))
+            $processInfo.RedirectStandardOutput = $true
+            $processInfo.RedirectStandardError = $true
+            $processInfo.UseShellExecute = $false
+            $processInfo.CreateNoWindow = $true
+
+            $process = New-Object System.Diagnostics.Process
+            $process.StartInfo = $processInfo
+            
+            $outputBuilder = New-Object System.Text.StringBuilder
+            $stdOutEvent = Register-ObjectEvent -InputObject $process -EventName OutputDataReceived -Action {
+                if ($EventArgs.Data) { $Event.MessageData.AppendLine($EventArgs.Data) }
+            } -MessageData $outputBuilder
+
+            $stdErrEvent = Register-ObjectEvent -InputObject $process -EventName ErrorDataReceived -Action {
+                if ($EventArgs.Data) { $Event.MessageData.AppendLine($EventArgs.Data) }
+            } -MessageData $outputBuilder
+
+            [void]$process.Start()
+            $process.BeginOutputReadLine()
+            $process.BeginErrorReadLine()
+            $process.WaitForExit()
+
+            $compileExit = $process.ExitCode
+
+            Unregister-Event -SourceIdentifier $stdOutEvent.Name
+            Unregister-Event -SourceIdentifier $stdErrEvent.Name
+
+            $outputBuilder.ToString() | Set-Content $log -Encoding UTF8
           } catch {
             $_ | Out-String | Add-Content $log
             $compileExit = 1
