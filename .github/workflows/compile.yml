@@ -1,4 +1,4 @@
-name: Compile Pawn
+Name: Compile Pawn
 
 on:
   workflow_dispatch:
@@ -188,28 +188,15 @@ jobs:
 
           $compilerDir = $compiler.DirectoryName
 
-          $dllFiles = Get-ChildItem work -Recurse -File -Filter "*.dll"
-          $dllDirs = $dllFiles |
-            ForEach-Object { $_.DirectoryName } |
-            Sort-Object -Unique
+          # ИСПРАВЛЕНИЕ: Копируем только системные DLL компилятора, не трогая плагины сервера
+          $compilerDlls = Get-ChildItem work -Recurse -File | Where-Object { $_.Name -ieq "pawnc.dll" -or $_.Name -ieq "pawnv.dll" }
 
-          $env:PATH = (
-            ($dllDirs -join ";") +
-            ";" + $compilerDir +
-            ";" + $env:PATH
-          )
-
-          $env:PATH | Set-Content out\dll_search_path.txt
-
-          foreach ($dll in $dllFiles) {
+          foreach ($dll in $compilerDlls) {
             $destination = Join-Path $compilerDir $dll.Name
 
-            if (
-              $dll.FullName -ne $destination -and
-              -not (Test-Path $destination)
-            ) {
+            if ($dll.FullName -ne $destination -and -not (Test-Path $destination)) {
               Copy-Item $dll.FullName $destination -Force
-              Write-Host "Copied DLL: $($dll.Name)"
+              Write-Host "Copied compiler DLL: $($dll.Name)"
             }
           }
 
@@ -280,7 +267,6 @@ jobs:
           $report += "Compiler startup exit code: $testExit"
           $report | Set-Content out\compiler_diagnostics.txt
 
-          # This step is diagnostic; compilation has its own failure check.
           exit 0
 
       - name: Compile main
@@ -321,8 +307,6 @@ jobs:
 
           $includeDirs = Get-ChildItem work -Recurse -Directory -Filter include
 
-          # Diagnostic test without -d3. If this succeeds, debug information
-          # may be involved in the crash; it is not yet confirmed.
           $argsList = @($pwn.FullName)
 
           foreach ($inc in $includeDirs) {
