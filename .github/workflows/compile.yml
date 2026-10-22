@@ -45,15 +45,12 @@ jobs:
             Write-Host "Using the source extracted from src.zip."
           }
 
-      - name: Download and Install Official Open.MP Compiler
+      - name: Download Official Clean Pawn Compiler via GitHub API
         shell: pwsh
         run: |
-          $pwn = Get-ChildItem work -Recurse -File -Filter main.pwn | Sort-Object Length -Descending | Select-Object -First 1
-          if (-not $pwn) {
-            Write-Host "ERROR: main.pwn not found"
-            exit 1
-          }
-          $compilerDir = $pwn.DirectoryName
+          $compilerDest = Join-Path $env:GITHUB_WORKSPACE "compiler_bin"
+          if (Test-Path $compilerDest) { Remove-Item $compilerDest -Recurse -Force }
+          New-Item -ItemType Directory -Force -Path $compilerDest | Out-Null
 
           Write-Host "Fetching latest pawn compiler release info from open.mp..."
           $release = Invoke-RestMethod -Uri "https://api.github.com/repos/openmultiplayer/compiler/releases/latest" -Headers @{ "User-Agent" = "PowerShell" }
@@ -78,26 +75,28 @@ jobs:
             exit 1
           }
 
-          # Копируем свежий компилятор и все DLL прямо в папку с модом
-          Copy-Item (Join-Path $foundCompiler.DirectoryName "*") $compilerDir -Recurse -Force
-          Write-Host "Official Pawn compiler successfully placed into $compilerDir"
+          Copy-Item (Join-Path $foundCompiler.DirectoryName "*") $compilerDest -Recurse -Force
 
-          $finalCompilerExe = Join-Path $compilerDir "pawncc.exe"
-          $fileInfo = Get-Item $finalCompilerExe
-          Write-Host "Verified compiler size: $($fileInfo.Length) bytes"
+          $finalCompilerExe = Join-Path $compilerDest "pawncc.exe"
+          if (Test-Path $finalCompilerExe) {
+            $fileInfo = Get-Item $finalCompilerExe
+            Write-Host "Compiler verified: $($fileInfo.FullName) ($($fileInfo.Length) bytes)"
 
-          $bytes = [System.IO.File]::ReadAllBytes($finalCompilerExe)
-          if ($bytes.Length -lt 2 -or $bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) {
-            Write-Host "ERROR: pawncc.exe is not a valid PE executable!"
+            $bytes = [System.IO.File]::ReadAllBytes($finalCompilerExe)
+            if ($bytes.Length -lt 2 -or $bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) {
+              Write-Host "ERROR: Downloaded pawncc.exe is NOT a valid Windows executable!"
+              exit 1
+            }
+            Write-Host "MZ header verified successfully."
+          } else {
+            Write-Host "ERROR: pawncc.exe failed to copy into compiler_bin"
             exit 1
           }
-          Write-Host "Valid PE executable (MZ header) confirmed."
 
       - name: Patch Compiler for Large Address Aware (LAA)
         shell: pwsh
         run: |
-          $pwn = Get-ChildItem work -Recurse -File -Filter main.pwn | Sort-Object Length -Descending | Select-Object -First 1
-          $compilerPath = Join-Path $pwn.DirectoryName "pawncc.exe"
+          $compilerPath = Join-Path $env:GITHUB_WORKSPACE "compiler_bin\pawncc.exe"
 
           if (Test-Path $compilerPath) {
             $bytes = [System.IO.File]::ReadAllBytes($compilerPath)
@@ -179,13 +178,6 @@ jobs:
         run: |
           Write-Host "Checking Visual C++ 2010 runtime..."
 
-          foreach ($path in @(
-            "$env:WINDIR\SysWOW64\MSVCR100.dll",
-            "$env:WINDIR\System32\MSVCR100.dll"
-          )) {
-            Write-Host "$path : $(Test-Path $path)"
-          }
-
           if (-not (
             (Test-Path "$env:WINDIR\SysWOW64\MSVCR100.dll") -or
             (Test-Path "$env:WINDIR\System32\MSVCR100.dll")
@@ -206,7 +198,7 @@ jobs:
             exit 1
           }
 
-          $compiler = Get-Item (Join-Path $pwn.DirectoryName "pawncc.exe")
+          $compiler = Get-Item (Join-Path $env:GITHUB_WORKSPACE "compiler_bin\pawncc.exe")
           $includeDirs = Get-ChildItem work -Recurse -Directory -Filter include
 
           $argsList = @($pwn.FullName)
@@ -222,12 +214,11 @@ jobs:
           Write-Host "COMPILER: $($compiler.FullName)"
           Write-Host "INCLUDE DIRECTORIES: $($includeDirs.Count)"
 
-          Push-Location $pwn.DirectoryName
-
           try {
             $processInfo = New-Object System.Diagnostics.ProcessStartInfo
             $processInfo.FileName = $compiler.FullName
             $processInfo.Arguments = [string]::Join(" ", ($argsList | ForEach-Object { "`"$_`"" }))
+            $processInfo.WorkingDirectory = $compiler.DirectoryName
             $processInfo.RedirectStandardOutput = $true
             $processInfo.RedirectStandardError = $true
             $processInfo.UseShellExecute = $false
@@ -246,8 +237,6 @@ jobs:
           } catch {
             $_ | Out-String | Add-Content $log
             $compileExit = 1
-          } finally {
-            Pop-Location
           }
 
           Write-Host "COMPILER EXIT CODE: $compileExit"
