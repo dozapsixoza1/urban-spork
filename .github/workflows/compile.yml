@@ -49,6 +49,7 @@ jobs:
         shell: pwsh
         run: |
           $compilerDest = Join-Path $env:GITHUB_WORKSPACE "compiler_bin"
+          if (Test-Path $compilerDest) { Remove-Item $compilerDest -Recurse -Force }
           New-Item -ItemType Directory -Force -Path $compilerDest | Out-Null
 
           Write-Host "Fetching latest pawn compiler release info from open.mp..."
@@ -66,6 +67,8 @@ jobs:
           if (Test-Path $extractedTemp) { Remove-Item $extractedTemp -Recurse -Force }
 
           Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zipPath
+          
+          Write-Host "Zip downloaded. Size: $((Get-Item $zipPath).Length) bytes"
           Expand-Archive -Path $zipPath -DestinationPath $extractedTemp -Force
 
           $foundCompiler = Get-ChildItem $extractedTemp -Recurse -File -Filter pawncc.exe | Select-Object -First 1
@@ -74,8 +77,8 @@ jobs:
             exit 1
           }
 
+          Write-Host "Found compiler at: $($foundCompiler.FullName)"
           Copy-Item (Join-Path $foundCompiler.DirectoryName "*") $compilerDest -Recurse -Force
-          Write-Host "Official Pawn compiler successfully installed to $compilerDest"
 
           $finalCompilerExe = Join-Path $compilerDest "pawncc.exe"
           if (Test-Path $finalCompilerExe) {
@@ -92,28 +95,6 @@ jobs:
             Write-Host "ERROR: pawncc.exe failed to copy into compiler_bin"
             exit 1
           }
-
-      - name: Locate Pawn source
-        shell: pwsh
-        run: |
-          $pwn = Get-ChildItem work -Recurse -File -Filter main.pwn |
-            Sort-Object Length -Descending |
-            Select-Object -First 1
-
-          if (-not $pwn) {
-            Write-Host "ERROR: main.pwn not found"
-            exit 1
-          }
-
-          # Жестко используем чистый скачанный компилятор, игнорируя мусор из архива
-          $compiler = Get-Item (Join-Path $env:GITHUB_WORKSPACE "compiler_bin\pawncc.exe")
-
-          Write-Host "SOURCE: $($pwn.FullName)"
-          Write-Host "SOURCE SIZE: $($pwn.Length) bytes"
-          Write-Host "COMPILER: $($compiler.FullName)"
-
-          "SOURCE=$($pwn.FullName)" | Set-Content out\paths.txt
-          "COMPILER=$($compiler.FullName)" | Add-Content out\paths.txt
 
       - name: Patch Compiler for Large Address Aware (LAA)
         shell: pwsh
@@ -223,41 +204,6 @@ jobs:
             }
           }
 
-      - name: Diagnose compiler startup
-        shell: pwsh
-        run: |
-          $compilerPath = Join-Path $env:GITHUB_WORKSPACE "compiler_bin\pawncc.exe"
-          Write-Host "Testing compiler startup for: $compilerPath"
-
-          try {
-            $processInfo = New-Object System.Diagnostics.ProcessStartInfo
-            $processInfo.FileName = $compilerPath
-            $processInfo.RedirectStandardOutput = $true
-            $processInfo.RedirectStandardError = $true
-            $processInfo.UseShellExecute = $false
-            $processInfo.CreateNoWindow = $true
-
-            $process = New-Object System.Diagnostics.Process
-            $process.StartInfo = $processInfo
-            [void]$process.Start()
-
-            $stdOut = $process.StandardOutput.ReadToEnd()
-            $stdErr = $process.StandardError.ReadToEnd()
-            $process.WaitForExit()
-
-            $testExit = $process.ExitCode
-            ($stdOut + "`n" + $stdErr) | Set-Content "$env:GITHUB_WORKSPACE\out\compiler_test.log" -Encoding UTF8
-          } catch {
-            $_ | Out-String | Add-Content "$env:GITHUB_WORKSPACE\out\compiler_test.log"
-            $testExit = 1
-          }
-
-          Write-Host "Compiler startup exit code: $testExit"
-          if (Test-Path "$env:GITHUB_WORKSPACE\out\compiler_test.log") {
-            Get-Content "$env:GITHUB_WORKSPACE\out\compiler_test.log"
-          }
-          exit 0
-
       - name: Compile main
         shell: pwsh
         run: |
@@ -270,7 +216,6 @@ jobs:
             exit 1
           }
 
-          # Жестко используем чистый скачанный компилятор
           $compiler = Get-Item (Join-Path $env:GITHUB_WORKSPACE "compiler_bin\pawncc.exe")
 
           $includeDirs = Get-ChildItem work -Recurse -Directory -Filter include
