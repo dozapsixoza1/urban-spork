@@ -68,7 +68,6 @@ jobs:
           Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zipPath
           Expand-Archive -Path $zipPath -DestinationPath $extractedTemp -Force
 
-          # Находим pawncc.exe в распакованном архиве и копируем все файлы в compiler_bin
           $foundCompiler = Get-ChildItem $extractedTemp -Recurse -File -Filter pawncc.exe | Select-Object -First 1
           if (-not $foundCompiler) {
             Write-Host "ERROR: pawncc.exe not found in downloaded archive."
@@ -78,7 +77,6 @@ jobs:
           Copy-Item (Join-Path $foundCompiler.DirectoryName "*") $compilerDest -Recurse -Force
           Write-Host "Official Pawn compiler successfully installed to $compilerDest"
 
-          # Проверяем наличие бинарника
           $finalCompilerExe = Join-Path $compilerDest "pawncc.exe"
           if (Test-Path $finalCompilerExe) {
             $fileInfo = Get-Item $finalCompilerExe
@@ -233,31 +231,16 @@ jobs:
 
             $process = New-Object System.Diagnostics.Process
             $process.StartInfo = $processInfo
-            
-            $outputBuilder = New-Object System.Text.StringBuilder
-            $stdOutEvent = Register-ObjectEvent -InputObject $process -EventName OutputDataReceived -Action {
-                if ($EventArgs.Data) { $Event.MessageData.AppendLine($EventArgs.Data) }
-            } -MessageData $outputBuilder
-
-            $stdErrEvent = Register-ObjectEvent -InputObject $process -EventName ErrorDataReceived -Action {
-                if ($EventArgs.Data) { $Event.MessageData.AppendLine($EventArgs.Data) }
-            } -MessageData $outputBuilder
-
             [void]$process.Start()
-            $process.BeginOutputReadLine()
-            $process.BeginErrorReadLine()
+
+            $stdOut = $process.StandardOutput.ReadToEnd()
+            $stdErr = $process.StandardError.ReadToEnd()
             $process.WaitForExit()
 
             $testExit = $process.ExitCode
-
-            Unregister-Event -SourceIdentifier $stdOutEvent.Name
-            Unregister-Event -SourceIdentifier $stdErrEvent.Name
-
-            $outputBuilder.ToString() | Set-Content "$env:GITHUB_WORKSPACE\out\compiler_test.log" -Encoding UTF8
+            ($stdOut + "`n" + $stdErr) | Set-Content "$env:GITHUB_WORKSPACE\out\compiler_test.log" -Encoding UTF8
           } catch {
-            $_ | Out-String |
-              Add-Content "$env:GITHUB_WORKSPACE\out\compiler_test.log"
-
+            $_ | Out-String | Add-Content "$env:GITHUB_WORKSPACE\out\compiler_test.log"
             $testExit = 1
           }
 
@@ -309,27 +292,14 @@ jobs:
 
             $process = New-Object System.Diagnostics.Process
             $process.StartInfo = $processInfo
-            
-            $outputBuilder = New-Object System.Text.StringBuilder
-            $stdOutEvent = Register-ObjectEvent -InputObject $process -EventName OutputDataReceived -Action {
-                if ($EventArgs.Data) { $Event.MessageData.AppendLine($EventArgs.Data) }
-            } -MessageData $outputBuilder
-
-            $stdErrEvent = Register-ObjectEvent -InputObject $process -EventName ErrorDataReceived -Action {
-                if ($EventArgs.Data) { $Event.MessageData.AppendLine($EventArgs.Data) }
-            } -MessageData $outputBuilder
-
             [void]$process.Start()
-            $process.BeginOutputReadLine()
-            $process.BeginErrorReadLine()
+
+            $stdOut = $process.StandardOutput.ReadToEnd()
+            $stdErr = $process.StandardError.ReadToEnd()
             $process.WaitForExit()
 
             $compileExit = $process.ExitCode
-
-            Unregister-Event -SourceIdentifier $stdOutEvent.Name
-            Unregister-Event -SourceIdentifier $stdErrEvent.Name
-
-            $outputBuilder.ToString() | Set-Content $log -Encoding UTF8
+            ($stdOut + "`n" + $stdErr) | Set-Content $log -Encoding UTF8
           } catch {
             $_ | Out-String | Add-Content $log
             $compileExit = 1
