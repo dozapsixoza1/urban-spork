@@ -62,12 +62,20 @@ jobs:
 
           Write-Host "Downloading from: $($asset.browser_download_url)"
           $zipPath = Join-Path $env:TEMP "pawnc.zip"
-          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zipPath
+          $extractedPath = Join-Path $env:TEMP "pawnc_extracted"
+          if (Test-Path $extractedPath) { Remove-Item $extractedPath -Recurse -Force }
 
-          Expand-Archive -Path $zipPath -DestinationPath (Join-Path $env:TEMP "pawnc_extracted") -Force
-          
-          Copy-Item (Join-Path $env:TEMP "pawnc_extracted\bin\*") $compilerDir -Recurse -Force
-          Write-Host "Pawn compiler successfully installed and updated."
+          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zipPath
+          Expand-Archive -Path $zipPath -DestinationPath $extractedPath -Force
+
+          $downloadedCompiler = Get-ChildItem $extractedPath -Recurse -File -Filter pawncc.exe | Select-Object -First 1
+          if (-not $downloadedCompiler) {
+            Write-Host "ERROR: pawncc.exe not found in extracted archive."
+            exit 1
+          }
+
+          Copy-Item (Join-Path $downloadedCompiler.DirectoryName "*") $compilerDir -Recurse -Force
+          Write-Host "Pawn compiler successfully installed and updated into $compilerDir."
 
       - name: Locate Pawn source and compiler
         shell: pwsh
