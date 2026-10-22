@@ -233,6 +233,46 @@ jobs:
               Write-Host "$($_.Name) ($($_.Length) bytes)"
             }
 
+      - name: Diagnose compiler startup
+        shell: pwsh
+        run: |
+          $pwn = Get-ChildItem work -Recurse -File -Filter main.pwn |
+            Sort-Object Length -Descending |
+            Select-Object -First 1
+
+          $preferred = Join-Path $pwn.DirectoryName "pawncc.exe"
+
+          if (Test-Path $preferred) {
+            $compiler = Get-Item $preferred
+          } else {
+            $compiler = Get-ChildItem work -Recurse -File -Filter pawncc.exe |
+              Select-Object -First 1
+          }
+
+          if (-not $compiler) {
+            Write-Host "ERROR: pawncc.exe not found"
+            exit 1
+          }
+
+          Write-Host "Testing compiler startup..."
+
+          Push-Location $compiler.DirectoryName
+
+          try {
+            & $compiler.FullName > "$env:GITHUB_WORKSPACE\out\compiler_test.log" 2>&1
+            $testExit = $LASTEXITCODE
+          } catch {
+            $_ | Out-String |
+              Add-Content "$env:GITHUB_WORKSPACE\out\compiler_test.log"
+
+            $testExit = 1
+          } finally {
+            Pop-Location
+          }
+
+          Write-Host "Compiler startup exit code: $testExit"
+          exit 0
+
       - name: Compile main
         shell: pwsh
         run: |
@@ -287,7 +327,7 @@ jobs:
           Push-Location $pwn.DirectoryName
 
           try {
-            & $compiler.FullName @argsList *> $log
+            & $compiler.FullName @argsList > $log 2>&1
             $compileExit = $LASTEXITCODE
           } catch {
             $_ | Out-String | Add-Content $log
