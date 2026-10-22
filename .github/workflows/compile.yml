@@ -51,21 +51,13 @@ jobs:
           $compilerDest = Join-Path $env:GITHUB_WORKSPACE "compiler_bin"
           New-Item -ItemType Directory -Force -Path $compilerDest | Out-Null
 
-          Write-Host "Fetching latest pawn compiler release info from open.mp..."
-          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/openmultiplayer/compiler/releases/latest" -Headers @{ "User-Agent" = "PowerShell" }
-          $asset = $release.assets | Where-Object { $_.name -like "*windows*" } | Select-Object -First 1
-
-          if (-not $asset) {
-            Write-Host "ERROR: Could not find Windows compiler asset in latest release."
-            exit 1
-          }
-
-          Write-Host "Downloading from: $($asset.browser_download_url)"
+          Write-Host "Downloading official open.mp pawn compiler..."
+          $url = "https://github.com/openmultiplayer/compiler/releases/latest/download/pawnc-windows.zip"
           $zipPath = Join-Path $env:TEMP "pawnc_official.zip"
           $extractedTemp = Join-Path $env:TEMP "pawnc_extracted_temp"
           if (Test-Path $extractedTemp) { Remove-Item $extractedTemp -Recurse -Force }
 
-          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zipPath
+          Invoke-WebRequest -Uri $url -OutFile $zipPath
           Expand-Archive -Path $zipPath -DestinationPath $extractedTemp -Force
 
           $foundCompiler = Get-ChildItem $extractedTemp -Recurse -File -Filter pawncc.exe | Select-Object -First 1
@@ -80,7 +72,16 @@ jobs:
           $finalCompilerExe = Join-Path $compilerDest "pawncc.exe"
           if (Test-Path $finalCompilerExe) {
             $fileInfo = Get-Item $finalCompilerExe
-            Write-Host "Compiler verified: $($fileInfo.FullName) ($($fileInfo.Length) bytes)"
+            Write-Host "Compiler file size: $($fileInfo.Length) bytes"
+
+            # Проверка, что это валидный PE-файл (начинается с MZ)
+            $bytes = [System.IO.File]::ReadAllBytes($finalCompilerExe)
+            if ($bytes.Length -lt 2 -or $bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) {
+              Write-Host "ERROR: Downloaded pawncc.exe is NOT a valid Windows executable! Content preview:"
+              [System.Text.Encoding]::UTF8.GetString($bytes, 0, [Math]::Min($bytes.Length, 300))
+              exit 1
+            }
+            Write-Host "Compiler PE header verified successfully (MZ header found)."
           } else {
             Write-Host "ERROR: pawncc.exe failed to copy into compiler_bin"
             exit 1
