@@ -45,6 +45,30 @@ jobs:
             Write-Host "Using the source extracted from src.zip."
           }
 
+      - name: Download Official Pawn Compiler via GitHub API
+        shell: pwsh
+        run: |
+          $pwn = Get-ChildItem work -Recurse -File -Filter main.pwn | Sort-Object Length -Descending | Select-Object -First 1
+          $compilerDir = $pwn.DirectoryName
+
+          Write-Host "Fetching latest pawn compiler release info..."
+          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/openmultiplayer/compiler/releases/latest" -Headers @{ "User-Agent" = "PowerShell" }
+          $asset = $release.assets | Where-Object { $_.name -like "*windows*" } | Select-Object -First 1
+
+          if (-not $asset) {
+            Write-Host "ERROR: Could not find Windows compiler asset in latest release."
+            exit 1
+          }
+
+          Write-Host "Downloading from: $($asset.browser_download_url)"
+          $zipPath = Join-Path $env:TEMP "pawnc.zip"
+          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zipPath
+
+          Expand-Archive -Path $zipPath -DestinationPath (Join-Path $env:TEMP "pawnc_extracted") -Force
+          
+          Copy-Item (Join-Path $env:TEMP "pawnc_extracted\bin\*") $compilerDir -Recurse -Force
+          Write-Host "Pawn compiler successfully installed and updated."
+
       - name: Locate Pawn source and compiler
         shell: pwsh
         run: |
@@ -163,6 +187,143 @@ jobs:
               Write-Host "No alternate RakNet include found."
             }
           }
+
+      - name: Install Visual C++ 2010 Runtime
+        shell: pwsh
+        run: |
+          Write-Host "Checking Visual C++ 2010 runtime..."
+
+          foreach ($path in @(
+            "$env:WINDIR\SysWOW64\MSVCR100.dll",
+            "$env:WINDIR\System32\MSVCR100.dll"
+          )) {
+            Write-Host "$path : $(Test-Path $path)"
+          }
+
+          if (-not (
+            (Test-Path "$env:WINDIR\SysWOW64\MSVCR100.dll") -or
+            (Test-Path "$env:WINDIR\System32\MSVCR100.dll")
+          )) {
+            choco install vcredist2010 -y --no-progress
+
+            Write-Host "Chocolatey exit code: $LASTEXITCODE"
+
+            foreach ($path in @(
+              "$env:WINDIR\SysWOW64\MSVCR100.dll",
+              "$env:WINDIR\System32\MSVCR100.dll"
+            )) {
+              Write-Host "$path : $(Test-Path $path)"
+            }
+          }
+
+      - name: Prepare compiler DLL dependencies
+        shell: pwsh
+        run: |
+          $pwn = Get-ChildItem work -Recurse -File -Filter main.pwn |
+            Sort-Object Length -Descending |
+            Select-Object -First 1
+
+          $preferred = Join-Path $pwn.DirectoryName "pawncc.exe"
+
+          if (Test-Path $preferred) {
+            $compiler = Get-Item $preferred
+          } else {
+            $compiler = Get-ChildItem work -Recurse -File -Filter pawncc.exe |
+              Select-Object -First 1
+          }
+
+          if (-not $compiler) {
+            Write-Host "ERROR: pawncc.exe not found"
+            exit 1
+          }
+
+          $compilerDir = $compiler.DirectoryName
+
+          $compilerDlls = Get-ChildItem work -Recurse -File | Where-Object { $_.Name -ieq "pawnc.dll" -or $_.Name -ieq "pawnv.dll" }
+
+          foreach ($dll in $compilerDlls) {
+            $destination = Join-Path $compilerDir $dll.Name
+
+            if ($dll.FullName -ne $destination -and -not (Test-Path $destination)) {
+              Copy-Item $dll.FullName $destination -Force
+              Write-Host "Copied compiler DLL: $($dll.Name)"
+            }
+          }
+
+          Write-Host "Compiler: $($compiler.FullName)"
+
+          Get-ChildItem $compilerDir -File -Filter "*.dll" |
+            ForEach-Object {
+              Write-Host "$($_.Name) ($($_.Length) bytes)"
+            }
+
+      - name: Diagnose compiler startup
+        shell: pwsh
+        run: |
+          $pwn = Get-ChildItem work -Recurse -File -Filter main.pwn |
+            Sort-Object Length -Descending |
+            Select-Object -First 1
+
+          $preferred = Join-Path $pwn.DirectoryName "pawncc.exe"
+
+          if (Test-Path $preferred) {
+            $compiler = Get-Item $preferred
+          } else {
+            $compiler = Get-ChildItem work -Recurse -File -Filter pawncc.exe |
+              Select-Object -First 1
+          }
+
+          if (-not $compiler) {
+            Write-Host "ERROR: pawncc.exe not found"
+            exit 1
+          }
+
+          Write-Host "Testing compiler startup..."
+
+          Push-Location $compiler.DirectoryName
+
+          try {
+            $processInfo = New-Object System.Diagnostics.ProcessStartInfo
+            $processInfo.FileName = $compiler.FullName
+            $processInfo.RedirectStandardOutput = $true
+            $processInfo.RedirectStandardError = $true
+            $processInfo.UseShellExecute = $false
+            $processInfo.CreateNoWindow = $true
+
+            $process = New-Object System.Diagnostics.Process
+            $process.StartInfo = $processInfo
+            
+            $outputBuilder = New-Object System.Text.StringBuilder
+            $stdOutEvent = Register-ObjectEvent -InputObject $process -EventName OutputDataReceived -Action {
+                if ($EventArgs.Data) { $Event.MessageData.AppendLine($EventArgs.Data) }
+            } -MessageData $outputBuilder
+
+            $stdErrEvent = Register-ObjectEvent -InputObject $process -EventName ErrorDataReceived -Action {
+                if ($EventArgs.Data) { $Event.MessageData.AppendLine($EventArgs.Data) }
+            } -MessageData $outputBuilder
+
+            [void]$process.Start()
+            $process.BeginOutputReadLine()
+            $process.BeginErrorReadLine()
+            $process.WaitForExit()
+
+            $testExit = $process.ExitCode
+
+            Unregister-Event -SourceIdentifier $stdOutEvent.Name
+            Unregister-Event -SourceIdentifier $stdErrEvent.Name
+
+            $outputBuilder.ToString() | Set-Content "$env:GITHUB_WORKSPACE\out\compiler_test.log" -Encoding UTF8
+          } catch {
+            $_ | Out-String |
+              Add-Content "$env:GITHUB_WORKSPACE\out\compiler_test.log"
+
+            $testExit = 1
+          } finally {
+            Pop-Location
+          }
+
+          Write-Host "Compiler startup exit code: $testExit"
+          exit 0
 
       - name: Compile main
         shell: pwsh
