@@ -1,4 +1,4 @@
-Name: Compile Pawn
+name: Compile Pawn
 
 on:
   workflow_dispatch:
