@@ -94,13 +94,15 @@ jobs:
             $bytes = [System.IO.File]::ReadAllBytes($compilerPath)
             $peOffset = [System.BitConverter]::ToInt32($bytes, 0x3C)
             $charOffset = $peOffset + 22
-            $chars = [System.BitConverter]::ToUInt16($bytes, $charOffset)
+            [uint16]$chars = [System.BitConverter]::ToUInt16($bytes, $charOffset)
 
             if (($chars -band 0x0020) -eq 0) {
-              $chars = $chars -bor 0x0020
-              [System.BitConverter]::GetBytes($chars).CopyTo($bytes, $charOffset)
+              [uint16]$newChars = $chars -bor 0x0020
+              $patch = [System.BitConverter]::GetBytes($newChars)
+              $bytes[$charOffset]     = $patch[0]
+              $bytes[$charOffset + 1] = $patch[1]
               [System.IO.File]::WriteAllBytes($compilerPath, $bytes)
-              Write-Host "Successfully patched pawncc.exe with Large Address Aware (LAA) flag!"
+              Write-Host "Successfully patched pawncc.exe with LAA flag!"
             } else {
               Write-Host "pawncc.exe already has LAA flag set."
             }
