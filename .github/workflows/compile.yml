@@ -45,23 +45,44 @@ jobs:
             Write-Host "Using the source extracted from src.zip."
           }
 
-      - name: Prepare Pawn Compiler (from src.zip, fallback download)
+      - name: Prepare compilers (src.zip + downloaded 3.10.10)
         shell: pwsh
         run: |
-          $compilerDest = Join-Path $env:GITHUB_WORKSPACE "compiler_bin"
-          if (Test-Path $compilerDest) { Remove-Item $compilerDest -Recurse -Force }
-          New-Item -ItemType Directory -Force -Path $compilerDest | Out-Null
+          $ws = $env:GITHUB_WORKSPACE
+
+          function Test-Mz($exe) {
+            $b = [System.IO.File]::ReadAllBytes($exe)
+            return ($b.Length -ge 2 -and $b[0] -eq 0x4D -and $b[1] -eq 0x5A)
+          }
+
+          # --- компилятор из src.zip ---
+          $zipDir = Join-Path $ws "compiler_zip"
+          if (Test-Path $zipDir) { Remove-Item $zipDir -Recurse -Force }
 
           $zipCompiler = Get-ChildItem work -Recurse -File -Filter pawncc.exe |
             Select-Object -First 1
 
           if ($zipCompiler) {
-            Write-Host "Using compiler from src.zip: $($zipCompiler.FullName)"
-            Get-ChildItem $zipCompiler.DirectoryName -File | ForEach-Object {
-              Copy-Item $_.FullName $compilerDest -Force
+            New-Item -ItemType Directory -Force -Path $zipDir | Out-Null
+            Get-ChildItem $zipCompiler.DirectoryName -File |
+              Where-Object { $_.Extension -in @(".exe", ".dll") } |
+              ForEach-Object { Copy-Item $_.FullName $zipDir -Force }
+            Write-Host "Compiler from src.zip:"
+            Get-ChildItem $zipDir | Select-Object Name, Length
+            if (-not (Test-Mz (Join-Path $zipDir "pawncc.exe"))) {
+              Write-Host "WARNING: src.zip pawncc.exe has no MZ header, skipping it"
+              Remove-Item $zipDir -Recurse -Force
             }
           } else {
-            Write-Host "pawncc.exe not found in src.zip, downloading 3.10.10..."
+            Write-Host "pawncc.exe not found in src.zip"
+          }
+
+          # --- скачанный 3.10.10 ---
+          $dlDir = Join-Path $ws "compiler_dl"
+          if (Test-Path $dlDir) { Remove-Item $dlDir -Recurse -Force }
+
+          try {
+            New-Item -ItemType Directory -Force -Path $dlDir | Out-Null
             $url = "https://github.com/pawn-lang/compiler/releases/download/v3.10.10/pawnc-3.10.10-windows.zip"
             $zipPath = Join-Path $env:TEMP "pawnc.zip"
             Invoke-WebRequest -Uri $url -OutFile $zipPath
@@ -70,49 +91,25 @@ jobs:
             if (Test-Path $extractedTemp) { Remove-Item $extractedTemp -Recurse -Force }
             Expand-Archive -Path $zipPath -DestinationPath $extractedTemp -Force
 
-            Get-ChildItem $extractedTemp -Recurse -File | ForEach-Object {
-              Copy-Item $_.FullName $compilerDest -Force
+            Get-ChildItem $extractedTemp -Recurse -File |
+              Where-Object { $_.Extension -in @(".exe", ".dll") } |
+              ForEach-Object { Copy-Item $_.FullName $dlDir -Force }
+
+            Write-Host "Downloaded compiler 3.10.10:"
+            Get-ChildItem $dlDir | Select-Object Name, Length
+
+            if (-not (Test-Mz (Join-Path $dlDir "pawncc.exe"))) {
+              Write-Host "WARNING: downloaded pawncc.exe has no MZ header, skipping it"
+              Remove-Item $dlDir -Recurse -Force
             }
+          } catch {
+            Write-Host "WARNING: failed to download pawn compiler: $_"
+            if (Test-Path $dlDir) { Remove-Item $dlDir -Recurse -Force }
           }
 
-          Write-Host "Contents of compiler_bin:"
-          Get-ChildItem $compilerDest | Select-Object Name, Length
-
-          $finalCompilerExe = Join-Path $compilerDest "pawncc.exe"
-
-          if (-not (Test-Path $finalCompilerExe)) {
-            Write-Host "ERROR: pawncc.exe missing in compiler_bin!"
+          if (-not (Test-Path $zipDir) -and -not (Test-Path $dlDir)) {
+            Write-Host "ERROR: no usable compiler found"
             exit 1
-          }
-
-          $bytes = [System.IO.File]::ReadAllBytes($finalCompilerExe)
-          if ($bytes.Length -lt 2 -or $bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) {
-            Write-Host "ERROR: pawncc.exe does not have valid MZ header!"
-            exit 1
-          }
-          Write-Host "MZ header verified successfully."
-
-      - name: Patch Compiler for Large Address Aware (LAA)
-        shell: pwsh
-        run: |
-          $compilerPath = Join-Path $env:GITHUB_WORKSPACE "compiler_bin\pawncc.exe"
-
-          if (Test-Path $compilerPath) {
-            $bytes = [System.IO.File]::ReadAllBytes($compilerPath)
-            $peOffset = [System.BitConverter]::ToInt32($bytes, 0x3C)
-            $charOffset = $peOffset + 22
-            [uint16]$chars = [System.BitConverter]::ToUInt16($bytes, $charOffset)
-
-            if (($chars -band 0x0020) -eq 0) {
-              [uint16]$newChars = $chars -bor 0x0020
-              $patch = [System.BitConverter]::GetBytes($newChars)
-              $bytes[$charOffset]     = $patch[0]
-              $bytes[$charOffset + 1] = $patch[1]
-              [System.IO.File]::WriteAllBytes($compilerPath, $bytes)
-              Write-Host "Successfully patched pawncc.exe with LAA flag!"
-            } else {
-              Write-Host "pawncc.exe already has LAA flag set."
-            }
           }
 
       - name: Remove Ctrl-Z bytes from Pawn sources
@@ -187,9 +184,11 @@ jobs:
             Write-Host "Chocolatey exit code: $LASTEXITCODE"
           }
 
-      - name: Compile main
+      - name: Compile main (try several compiler variants)
         shell: pwsh
         run: |
+          $ws = $env:GITHUB_WORKSPACE
+
           $pwn = Get-ChildItem work -Recurse -File -Filter main.pwn |
             Sort-Object Length -Descending |
             Select-Object -First 1
@@ -199,80 +198,130 @@ jobs:
             exit 1
           }
 
-          $compiler = Get-Item (Join-Path $env:GITHUB_WORKSPACE "compiler_bin\pawncc.exe")
           $includeDirs = Get-ChildItem work -Recurse -Directory -Filter include
 
           $argsList = @($pwn.FullName)
-
           foreach ($inc in $includeDirs) {
             $argsList += "-i$($inc.FullName)"
           }
 
-          $log = Join-Path $env:GITHUB_WORKSPACE "out\compile.log"
-
           Write-Host "SOURCE: $($pwn.FullName)"
           Write-Host "SOURCE SIZE: $($pwn.Length)"
-          Write-Host "COMPILER: $($compiler.FullName)"
           Write-Host "INCLUDE DIRECTORIES: $($includeDirs.Count)"
 
-          try {
-            $processInfo = New-Object System.Diagnostics.ProcessStartInfo
-            $processInfo.FileName = $compiler.FullName
-            $processInfo.Arguments = [string]::Join(" ", ($argsList | ForEach-Object { "`"$_`"" }))
-            $processInfo.WorkingDirectory = $compiler.DirectoryName
-            $processInfo.RedirectStandardOutput = $true
-            $processInfo.RedirectStandardError = $true
-            $processInfo.UseShellExecute = $false
-            $processInfo.CreateNoWindow = $true
-
-            $process = New-Object System.Diagnostics.Process
-            $process.StartInfo = $processInfo
-            [void]$process.Start()
-
-            $stdOut = $process.StandardOutput.ReadToEnd()
-            $stdErr = $process.StandardError.ReadToEnd()
-            $process.WaitForExit()
-
-            $compileExit = $process.ExitCode
-            ($stdOut + "`n" + $stdErr) | Set-Content $log -Encoding UTF8
-          } catch {
-            $_ | Out-String | Add-Content $log
-            $compileExit = 1
-          }
-
-          Write-Host "COMPILER EXIT CODE: $compileExit"
-
-          if (Test-Path $log) {
-            Get-Content $log -Tail 300
-          }
-
-          "Compiler exit code: $compileExit" |
-            Set-Content out\compiler_status.txt
-
-          if ($compileExit -ne 0) {
-            Write-Host "ERROR: Pawn compiler failed."
-            exit 1
-          }
-
           $amxPath = Join-Path $pwn.DirectoryName "main.amx"
+          $summary = Join-Path $ws "out\summary.txt"
+          "" | Set-Content $summary
 
-          if (-not (Test-Path $amxPath)) {
-            Write-Host "ERROR: main.amx was not generated"
-            exit 1
+          function Set-Laa($exe) {
+            $bytes = [System.IO.File]::ReadAllBytes($exe)
+            $peOffset = [System.BitConverter]::ToInt32($bytes, 0x3C)
+            $charOffset = $peOffset + 22
+            [uint16]$chars = [System.BitConverter]::ToUInt16($bytes, $charOffset)
+            if (($chars -band 0x0020) -eq 0) {
+              [uint16]$newChars = $chars -bor 0x0020
+              $patch = [System.BitConverter]::GetBytes($newChars)
+              $bytes[$charOffset]     = $patch[0]
+              $bytes[$charOffset + 1] = $patch[1]
+              [System.IO.File]::WriteAllBytes($exe, $bytes)
+            }
           }
 
-          $amx = Get-Item $amxPath
+          function Invoke-Pawn($dir, $label) {
+            $exe = Join-Path $dir "pawncc.exe"
+            $log = Join-Path $ws "out\compile_$label.log"
 
-          Write-Host "AMX SIZE: $($amx.Length) bytes"
+            if (Test-Path $amxPath) { Remove-Item $amxPath -Force }
 
-          if ($amx.Length -lt 1000000) {
-            Write-Host "ERROR: AMX is suspiciously small."
-            exit 1
+            $code = 1
+            try {
+              $psi = New-Object System.Diagnostics.ProcessStartInfo
+              $psi.FileName = $exe
+              $psi.Arguments = [string]::Join(" ", ($argsList | ForEach-Object { "`"$_`"" }))
+              $psi.WorkingDirectory = $pwn.DirectoryName
+              $psi.RedirectStandardOutput = $true
+              $psi.RedirectStandardError = $true
+              $psi.UseShellExecute = $false
+              $psi.CreateNoWindow = $true
+
+              $p = New-Object System.Diagnostics.Process
+              $p.StartInfo = $psi
+              [void]$p.Start()
+
+              $stdOut = $p.StandardOutput.ReadToEnd()
+              $stdErr = $p.StandardError.ReadToEnd()
+              $p.WaitForExit()
+
+              $code = $p.ExitCode
+              ($stdOut + "`n" + $stdErr) | Set-Content $log -Encoding UTF8
+            } catch {
+              $_ | Out-String | Set-Content $log
+              $code = 1
+            }
+
+            return $code
           }
 
-          Copy-Item $amxPath "out\main.amx" -Force
+          # собираем список вариантов
+          $variants = @()
 
-          Write-Host "BUILD OK"
+          $zipDir = Join-Path $ws "compiler_zip"
+          if (Test-Path $zipDir) {
+            $variants += @{ Label = "zip_noLAA"; Dir = $zipDir }
+            $zipLaa = Join-Path $ws "compiler_zip_laa"
+            if (Test-Path $zipLaa) { Remove-Item $zipLaa -Recurse -Force }
+            Copy-Item $zipDir $zipLaa -Recurse
+            Set-Laa (Join-Path $zipLaa "pawncc.exe")
+            $variants += @{ Label = "zip_LAA"; Dir = $zipLaa }
+          }
+
+          $dlDir = Join-Path $ws "compiler_dl"
+          if (Test-Path $dlDir) {
+            $variants += @{ Label = "dl_noLAA"; Dir = $dlDir }
+            $dlLaa = Join-Path $ws "compiler_dl_laa"
+            if (Test-Path $dlLaa) { Remove-Item $dlLaa -Recurse -Force }
+            Copy-Item $dlDir $dlLaa -Recurse
+            Set-Laa (Join-Path $dlLaa "pawncc.exe")
+            $variants += @{ Label = "dl_LAA"; Dir = $dlLaa }
+          }
+
+          $success = $false
+
+          foreach ($v in $variants) {
+            Write-Host ""
+            Write-Host "=== TRY: $($v.Label) ==="
+            $code = Invoke-Pawn $v.Dir $v.Label
+            Write-Host "EXIT CODE: $code"
+
+            $log = Join-Path $ws "out\compile_$($v.Label).log"
+            if (Test-Path $log) { Get-Content $log -Tail 100 }
+
+            $amxOk = $false
+            if (Test-Path $amxPath) {
+              $amx = Get-Item $amxPath
+              Write-Host "AMX SIZE: $($amx.Length) bytes"
+              if ($amx.Length -ge 1000000) { $amxOk = $true }
+            }
+
+            "$($v.Label): exit=$code amx_ok=$amxOk" | Add-Content $summary
+
+            if ($code -eq 0 -and $amxOk) {
+              Copy-Item $amxPath (Join-Path $ws "out\main.amx") -Force
+              "WINNER: $($v.Label)" | Add-Content $summary
+              Write-Host "BUILD OK with $($v.Label)"
+              $success = $true
+              break
+            }
+          }
+
+          Write-Host ""
+          Write-Host "=== SUMMARY ==="
+          Get-Content $summary
+
+          if (-not $success) {
+            Write-Host "ERROR: all compiler variants failed"
+            exit 1
+          }
 
       - name: Upload logs and AMX
         if: always()
