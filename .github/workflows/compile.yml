@@ -328,7 +328,7 @@ jobs:
             exit 0
           }
 
-          # ---- сборка не удалась: ищем место падения ----
+          # ---- сборка не удалась: ищем место падения (с заходом в include) ----
           $bisectOut = Join-Path $ws "out\bisect.txt"
           "" | Set-Content $bisectOut
 
@@ -337,33 +337,52 @@ jobs:
             $text | Add-Content $bisectOut
           }
 
+          # ищет файл, который подключает строка вида: #include "name" / <name>
+          function Resolve-Include($line, $curDir) {
+            $m = [regex]::Match($line, '^\s*#\s*(?:include|tryinclude)\s*([<"])([^>"]+)[>"]')
+            if (-not $m.Success) { return $null }
+            $name = $m.Groups[2].Value.Trim() -replace '/', '\'
+
+            $dirs = @($curDir, $srcDir)
+            foreach ($d in $includeDirs) { $dirs += $d.FullName }
+
+            foreach ($d in $dirs) {
+              foreach ($ext in @("", ".inc", ".pwn")) {
+                $cand = Join-Path $d ($name + $ext)
+                if (Test-Path -LiteralPath $cand -PathType Leaf) {
+                  return (Resolve-Path -LiteralPath $cand).Path
+                }
+              }
+            }
+            return $null
+          }
+
           Log-Bisect ""
           Log-Bisect "=== ALL VARIANTS FAILED, STARTING CRASH BISECT ==="
 
           $latin1 = [System.Text.Encoding]::GetEncoding(28591)
-          $lines = [System.IO.File]::ReadAllLines($pwn.FullName, $latin1)
-          $total = $lines.Count
-          Log-Bisect "TOTAL LINES: $total"
-
-          $maxLen = 0
-          $longLines = @()
-          for ($i = 0; $i -lt $total; $i++) {
-            $len = $lines[$i].Length
-            if ($len -gt $maxLen) { $maxLen = $len }
-            if ($len -gt 4000) { $longLines += ($i + 1) }
-          }
-          Log-Bisect "MAX LINE LENGTH: $maxLen"
-          Log-Bisect "LINES LONGER THAN 4000 CHARS: $($longLines.Count)"
-          if ($longLines.Count -gt 0) {
-            Log-Bisect ("First long lines: " + (($longLines | Select-Object -First 20) -join ", "))
-          }
+          $mainLines = [System.IO.File]::ReadAllLines($pwn.FullName, $latin1)
+          Log-Bisect "TOTAL LINES IN main.pwn: $($mainLines.Count)"
 
           $bisectDir = $variants[0].Dir
           $bisectSrc = Join-Path $srcDir "_bisect.pwn"
           $bisectLog = Join-Path $ws "out\bisect_tmp.log"
 
+          # текущий файл, который режем: $null = main.pwn (пишем в _bisect.pwn), иначе путь к include
+          $script:curPath = $null
+          $script:curLines = $mainLines
+
+          function Write-Head($path, $n) {
+            $chunk = [string[]]@($script:curLines[0..($n - 1)])
+            [System.IO.File]::WriteAllLines($path, $chunk, $latin1)
+          }
+
           function Test-Head($n) {
-            [System.IO.File]::WriteAllLines($bisectSrc, $lines[0..($n - 1)], $latin1)
+            if ($script:curPath) {
+              Write-Head $script:curPath $n
+            } else {
+              Write-Head $bisectSrc $n
+            }
             $amxTmp = Join-Path $srcDir "_bisect.amx"
             if (Test-Path $amxTmp) { Remove-Item $amxTmp -Force }
             $code = Invoke-Pawn $bisectDir $bisectSrc $bisectLog
@@ -372,29 +391,73 @@ jobs:
             return $crash
           }
 
-          $lo = 1
-          $hi = $total
+          $curDir = $srcDir
+          $label = "main.pwn"
+          $depth = 0
 
-          if (-not (Test-Head $total)) {
-            Log-Bisect "Full-length copy did NOT crash in bisect mode. Crash depends on file name or path. See compile logs."
-          } else {
+          while ($true) {
+            $total = $script:curLines.Count
+            Log-Bisect ""
+            Log-Bisect "--- LEVEL $depth : $label ($total lines) ---"
+
+            if (-not (Test-Head $total)) {
+              Log-Bisect "No crash at full length of this level, stopping."
+              break
+            }
+
+            $lo = 1
+            $hi = $total
             while ($lo -lt $hi) {
               $mid = [int][Math]::Floor(($lo + $hi) / 2)
               if (Test-Head $mid) { $hi = $mid } else { $lo = $mid + 1 }
             }
 
             Log-Bisect ""
-            Log-Bisect "FIRST CRASHING LINE COUNT: $lo"
+            Log-Bisect "FIRST CRASHING LINE in ${label}: $lo"
 
             $from = [Math]::Max(1, $lo - 15)
             $to = [Math]::Min($total, $lo + 5)
-            Log-Bisect "--- lines $from .. $to of main.pwn ---"
+            Log-Bisect "--- lines $from .. $to ---"
             for ($i = $from; $i -le $to; $i++) {
-              $text = $lines[$i - 1]
-              if ($text.Length -gt 300) { $text = $text.Substring(0, 300) + " ...[cut, length $($lines[$i - 1].Length)]" }
+              $text = $script:curLines[$i - 1]
+              if ($text.Length -gt 300) {
+                $text = $text.Substring(0, 300) + " ...[cut, length $($script:curLines[$i - 1].Length)]"
+              }
               $mark = if ($i -eq $lo) { ">>" } else { "  " }
               Log-Bisect ("{0} {1,6}: {2}" -f $mark, $i, $text)
             }
+
+            $crashLine = $script:curLines[$lo - 1]
+            $incPath = Resolve-Include $crashLine $curDir
+
+            if (-not $incPath) {
+              Log-Bisect ""
+              Log-Bisect "ROOT CAUSE LOCATION: $label line $lo (not an include, deepest level reached)"
+              break
+            }
+
+            if ($depth -ge 8) {
+              Log-Bisect "Max depth reached, stopping at include: $incPath"
+              break
+            }
+
+            # фиксируем текущий уровень: обрезаем по строку с include включительно
+            if ($script:curPath) {
+              Write-Head $script:curPath $lo
+            } else {
+              Write-Head $bisectSrc $lo
+            }
+
+            # спускаемся внутрь подключаемого файла
+            $shortName = $incPath.Replace("$ws\", "")
+            Log-Bisect ""
+            Log-Bisect "Crash is triggered by include -> descending into $shortName"
+
+            $script:curPath = $incPath
+            $script:curLines = [System.IO.File]::ReadAllLines($incPath, $latin1)
+            $curDir = Split-Path $incPath -Parent
+            $label = $shortName
+            $depth++
           }
 
           Remove-Item $bisectSrc -Force -ErrorAction SilentlyContinue
