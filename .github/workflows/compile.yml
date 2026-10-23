@@ -148,6 +148,72 @@ jobs:
 
           Write-Host "TOTAL Ctrl-Z bytes removed: $total"
 
+      - name: Workaround for pawncc crash in daily.inc (temp_idx)
+        shell: pwsh
+        run: |
+          $ws = $env:GITHUB_WORKSPACE
+          $latin1 = [System.Text.Encoding]::GetEncoding(28591)
+          $report = Join-Path $ws "out\temp_idx_grep.txt"
+
+          # где вообще встречается temp_idx (в том числе #define)
+          "=== temp_idx occurrences ===" | Set-Content $report
+          Get-ChildItem work -Recurse -File |
+            Where-Object { $_.Extension -in @(".pwn", ".inc") } |
+            Select-String -Pattern 'temp_idx' -Encoding Latin1 |
+            Select-Object -First 80 |
+            ForEach-Object {
+              $rel = $_.Path.Replace("$ws\", "")
+              "{0}:{1}: {2}" -f $rel, $_.LineNumber, $_.Line.Trim()
+            } | Add-Content $report
+          Get-Content $report | Select-Object -First 40
+
+          # патч daily.inc: убираем 'new temp_idx = EXPR;' и подставляем EXPR в блок
+          $daily = Get-ChildItem work -Recurse -File -Filter daily.inc |
+            Where-Object { $_.FullName -like "*logic*player*main*" } |
+            Select-Object -First 1
+
+          if (-not $daily) {
+            Write-Host "daily.inc not found, patch skipped"
+            exit 0
+          }
+
+          $lines = [System.IO.File]::ReadAllLines($daily.FullName, $latin1)
+          $patched = 0
+          $log = @()
+
+          for ($i = 0; $i -lt $lines.Count; $i++) {
+            $m = [regex]::Match($lines[$i], '^\s*new\s+temp_idx\s*=\s*(.+?)\s*;\s*$')
+            if (-not $m.Success) { continue }
+
+            $expr = "(" + $m.Groups[1].Value + ")"
+            $log += "decl at line $($i + 1): $($lines[$i].Trim())"
+            $lines[$i] = ""
+
+            $depth = 0
+            for ($j = $i + 1; $j -lt $lines.Count; $j++) {
+              $line = $lines[$j]
+              $opens = ($line.ToCharArray() | Where-Object { $_ -eq '{' }).Count
+              $closes = ($line.ToCharArray() | Where-Object { $_ -eq '}' }).Count
+
+              if ($line -match '\btemp_idx\b') {
+                $lines[$j] = [regex]::Replace($line, '\btemp_idx\b', { param($mm) $expr })
+                $log += "  replaced in line $($j + 1)"
+              }
+
+              $depth += ($opens - $closes)
+              if ($depth -lt 0) { break }
+            }
+            $patched++
+          }
+
+          if ($patched -gt 0) {
+            [System.IO.File]::WriteAllLines($daily.FullName, $lines, $latin1)
+          }
+
+          Write-Host "daily.inc patched blocks: $patched"
+          $log | ForEach-Object { Write-Host $_ }
+          $log | Set-Content (Join-Path $ws "out\daily_patch.txt")
+
       - name: Fix RakNet include filename if needed
         shell: pwsh
         run: |
