@@ -184,7 +184,7 @@ jobs:
             Write-Host "Chocolatey exit code: $LASTEXITCODE"
           }
 
-      - name: Compile main (try several compiler variants)
+      - name: Compile main (variants + crash bisect)
         shell: pwsh
         run: |
           $ws = $env:GITHUB_WORKSPACE
@@ -198,18 +198,16 @@ jobs:
             exit 1
           }
 
+          $srcDir = $pwn.DirectoryName
           $includeDirs = Get-ChildItem work -Recurse -Directory -Filter include
-
-          $argsList = @($pwn.FullName)
-          foreach ($inc in $includeDirs) {
-            $argsList += "-i$($inc.FullName)"
-          }
+          $incArgs = @()
+          foreach ($inc in $includeDirs) { $incArgs += "-i$($inc.FullName)" }
 
           Write-Host "SOURCE: $($pwn.FullName)"
           Write-Host "SOURCE SIZE: $($pwn.Length)"
           Write-Host "INCLUDE DIRECTORIES: $($includeDirs.Count)"
 
-          $amxPath = Join-Path $pwn.DirectoryName "main.amx"
+          $amxPath = Join-Path $srcDir "main.amx"
           $summary = Join-Path $ws "out\summary.txt"
           "" | Set-Content $summary
 
@@ -227,18 +225,16 @@ jobs:
             }
           }
 
-          function Invoke-Pawn($dir, $label) {
-            $exe = Join-Path $dir "pawncc.exe"
-            $log = Join-Path $ws "out\compile_$label.log"
-
-            if (Test-Path $amxPath) { Remove-Item $amxPath -Force }
-
+          # запускает компилятор на файле, возвращает код выхода (124 = таймаут)
+          function Invoke-Pawn($compilerDir, $srcFile, $logFile) {
+            $exe = Join-Path $compilerDir "pawncc.exe"
+            $all = @($srcFile) + $incArgs
             $code = 1
             try {
               $psi = New-Object System.Diagnostics.ProcessStartInfo
               $psi.FileName = $exe
-              $psi.Arguments = [string]::Join(" ", ($argsList | ForEach-Object { "`"$_`"" }))
-              $psi.WorkingDirectory = $pwn.DirectoryName
+              $psi.Arguments = [string]::Join(" ", ($all | ForEach-Object { "`"$_`"" }))
+              $psi.WorkingDirectory = $srcDir
               $psi.RedirectStandardOutput = $true
               $psi.RedirectStandardError = $true
               $psi.UseShellExecute = $false
@@ -248,21 +244,30 @@ jobs:
               $p.StartInfo = $psi
               [void]$p.Start()
 
-              $stdOut = $p.StandardOutput.ReadToEnd()
-              $stdErr = $p.StandardError.ReadToEnd()
+              $tOut = $p.StandardOutput.ReadToEndAsync()
+              $tErr = $p.StandardError.ReadToEndAsync()
+
+              if (-not $p.WaitForExit(180000)) {
+                try { $p.Kill($true) } catch {}
+                "TIMEOUT" | Set-Content $logFile
+                return 124
+              }
               $p.WaitForExit()
 
               $code = $p.ExitCode
-              ($stdOut + "`n" + $stdErr) | Set-Content $log -Encoding UTF8
+              ($tOut.Result + "`n" + $tErr.Result) | Set-Content $logFile -Encoding UTF8
             } catch {
-              $_ | Out-String | Set-Content $log
+              $_ | Out-String | Set-Content $logFile
               $code = 1
             }
-
             return $code
           }
 
-          # собираем список вариантов
+          function Test-IsCrash($code) {
+            return ($code -lt 0 -or $code -gt 255)
+          }
+
+          # ---- собираем варианты компилятора ----
           $variants = @()
 
           $zipDir = Join-Path $ws "compiler_zip"
@@ -285,15 +290,17 @@ jobs:
             $variants += @{ Label = "dl_LAA"; Dir = $dlLaa }
           }
 
+          # ---- полная сборка ----
           $success = $false
 
           foreach ($v in $variants) {
             Write-Host ""
             Write-Host "=== TRY: $($v.Label) ==="
-            $code = Invoke-Pawn $v.Dir $v.Label
-            Write-Host "EXIT CODE: $code"
+            if (Test-Path $amxPath) { Remove-Item $amxPath -Force }
 
             $log = Join-Path $ws "out\compile_$($v.Label).log"
+            $code = Invoke-Pawn $v.Dir $pwn.FullName $log
+            Write-Host "EXIT CODE: $code"
             if (Test-Path $log) { Get-Content $log -Tail 100 }
 
             $amxOk = $false
@@ -314,14 +321,89 @@ jobs:
             }
           }
 
+          if ($success) {
+            Write-Host ""
+            Write-Host "=== SUMMARY ==="
+            Get-Content $summary
+            exit 0
+          }
+
+          # ---- сборка не удалась: ищем место падения ----
+          $bisectOut = Join-Path $ws "out\bisect.txt"
+          "" | Set-Content $bisectOut
+
+          function Log-Bisect($text) {
+            Write-Host $text
+            $text | Add-Content $bisectOut
+          }
+
+          Log-Bisect ""
+          Log-Bisect "=== ALL VARIANTS FAILED, STARTING CRASH BISECT ==="
+
+          $latin1 = [System.Text.Encoding]::GetEncoding(28591)
+          $lines = [System.IO.File]::ReadAllLines($pwn.FullName, $latin1)
+          $total = $lines.Count
+          Log-Bisect "TOTAL LINES: $total"
+
+          $maxLen = 0
+          $longLines = @()
+          for ($i = 0; $i -lt $total; $i++) {
+            $len = $lines[$i].Length
+            if ($len -gt $maxLen) { $maxLen = $len }
+            if ($len -gt 4000) { $longLines += ($i + 1) }
+          }
+          Log-Bisect "MAX LINE LENGTH: $maxLen"
+          Log-Bisect "LINES LONGER THAN 4000 CHARS: $($longLines.Count)"
+          if ($longLines.Count -gt 0) {
+            Log-Bisect ("First long lines: " + (($longLines | Select-Object -First 20) -join ", "))
+          }
+
+          $bisectDir = $variants[0].Dir
+          $bisectSrc = Join-Path $srcDir "_bisect.pwn"
+          $bisectLog = Join-Path $ws "out\bisect_tmp.log"
+
+          function Test-Head($n) {
+            [System.IO.File]::WriteAllLines($bisectSrc, $lines[0..($n - 1)], $latin1)
+            $amxTmp = Join-Path $srcDir "_bisect.amx"
+            if (Test-Path $amxTmp) { Remove-Item $amxTmp -Force }
+            $code = Invoke-Pawn $bisectDir $bisectSrc $bisectLog
+            $crash = Test-IsCrash $code
+            Log-Bisect "  head $n lines -> exit $code (crash=$crash)"
+            return $crash
+          }
+
+          $lo = 1
+          $hi = $total
+
+          if (-not (Test-Head $total)) {
+            Log-Bisect "Full-length copy did NOT crash in bisect mode. Crash depends on file name or path. See compile logs."
+          } else {
+            while ($lo -lt $hi) {
+              $mid = [int][Math]::Floor(($lo + $hi) / 2)
+              if (Test-Head $mid) { $hi = $mid } else { $lo = $mid + 1 }
+            }
+
+            Log-Bisect ""
+            Log-Bisect "FIRST CRASHING LINE COUNT: $lo"
+
+            $from = [Math]::Max(1, $lo - 15)
+            $to = [Math]::Min($total, $lo + 5)
+            Log-Bisect "--- lines $from .. $to of main.pwn ---"
+            for ($i = $from; $i -le $to; $i++) {
+              $text = $lines[$i - 1]
+              if ($text.Length -gt 300) { $text = $text.Substring(0, 300) + " ...[cut, length $($lines[$i - 1].Length)]" }
+              $mark = if ($i -eq $lo) { ">>" } else { "  " }
+              Log-Bisect ("{0} {1,6}: {2}" -f $mark, $i, $text)
+            }
+          }
+
+          Remove-Item $bisectSrc -Force -ErrorAction SilentlyContinue
+
           Write-Host ""
           Write-Host "=== SUMMARY ==="
           Get-Content $summary
-
-          if (-not $success) {
-            Write-Host "ERROR: all compiler variants failed"
-            exit 1
-          }
+          Write-Host "ERROR: all compiler variants failed, see bisect output above"
+          exit 1
 
       - name: Upload logs and AMX
         if: always()
